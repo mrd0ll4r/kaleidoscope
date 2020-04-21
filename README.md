@@ -137,14 +137,14 @@ These are:
 
 - `KALEIDOSCOPE_VERSION: int`, which denotes the version of the Runtime.
 - `START: f64` and `NOW: f64` denote the program epoch and current timestamp, both as `f64` seconds.
-- `noise2d(f64, f64) -> f64` computes 2D Perlin noise.
+- `noise2d(f64, f64) -> f64` computes 2D Perlin noise in `[-1,1]`.
     This is implemented in Rust and relatively fast.
-- `noise3d(f64, f64, f64) -> f64` computes 3D Perlin noise.
+- `noise3d(f64, f64, f64) -> f64` computes 3D Perlin noise in `[-1,1]`.
     This is implemented in Rust and slower than the 2D version.
-- `noise4d(f64, f64, f64, f64) -> f64` computes 4D Perlin noise.
+- `noise4d(f64, f64, f64, f64) -> f64` computes 4D Perlin noise in `[-1,1]`.
     This is implemented in Rust and slower than the 3D version.
 
-The following are implemented in Lua and can be found in [programs/builtin.lua](programs/builtin.lua):
+The following are implemented in Lua and can be found in [src/builtin.lua](src/builtin.lua):
 
 - `now() -> f64` gets the time in seconds since the program epoch.
 - `clamp(from: numer, to: number, x: number) -> number` clamps `x` to `[from, to]`. 
@@ -166,6 +166,24 @@ The following are implemented in Lua and can be found in [programs/builtin.lua](
     Specifically, values `set_` by other programs are not visible during the current tick.
 - `EVENT_TYPE_CHANGE`, `EVENT_TYPE_BUTTON_DOWN`, `EVENT_TYPE_BUTTON_UP`, `EVENT_TYPE_BUTTON_CLICKED`, and
     `EVENT_TYPE_BUTTON_LONG_PRESS` are string constants for the event types.
+
+## Example Programs
+
+The [programs/](programs) directory contains a few example programs.
+Specifically, you can look at them to see the following:
+
+- [programs/sine.lua](programs/sine.lua) computes four time-shifted narrow sines for one RGBW strip.
+    It does not use any events and shows how to organize code in a useful manner.
+- [programs/noise.lua](programs/noise.lua) generates Perlin noise for one RGBW strip.
+    Note that we use 2D Perlin noise with a fixed value for `x` and a time-dependent `y`.
+    In practice, we sample parallel lines from the 2D space.
+- [programs/motion-button.lua](programs/motion-button.lua) reacts to events for buttons and motion sensors to smoothly
+    switch lighting.
+    There is a couple of things to note here:
+    - We show two different ways to interact with events, either by routing them to different handler functions or
+        by routing them through one handler function and switching by address.
+    - We show Lua tables.
+    - We show that reading values and resolving aliases to addresses is possible in `setup()`.
 
 ## Compilation & Running
 
