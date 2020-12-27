@@ -5,24 +5,26 @@ authors = ["Leo Balduf <leobalduf@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-alloy = {git = "https://github.com/mrd0ll4r/alloy"}
-#alloy = {path = "../alloy"}
-failure = { version = "0.1.7", features = ["std","backtrace"] }
-log = { version = "0.4.8", features = ["std","serde"] }
-flexi_logger = { version = "0.15.2", features = ["ziplogs"] }
+#alloy = {git = "https://github.com/mrd0ll4r/alloy"}
+alloy = {path = "../alloy"}
+failure = { version = "0.1", features = ["std","backtrace"] }
+log = { version = "0.4", features = ["std","serde"] }
+flexi_logger = { version = "0.16", features = ["compress"] }
 #serde = {version="1.0.104",features=["derive"]}
 #serde_json = "1.0.46"
-itertools = "0.9.0"
+itertools = "0.9"
 
 # Tokio, Lua, Runtime
-tokio = { version = "0.2.18", features = ["rt-threaded","macros","stream","sync","net","time","tcp"] }
-futures = "0.3.4"
-interpolation = "0.2.0"
-noise = "0.6.0"
-rlua = "0.17.0"
+tokio = { version = "1", features = ["rt-multi-thread","macros","sync","net","time"] }
+tokio-stream = "0.1"
+futures = "0.3"
+interpolation = "0.2"
+noise = "0.7"
+rlua = "0.17"
+chrono = "0.4"
 
 # Prometheus
-prometheus_exporter = "0.4.1"
-prometheus = { version = "0.8.0", features = ["process"] }
-lazy_static = "1.4.0"
-systemstat = "0.1.5"
+prometheus_exporter = "0.7.2"
+prometheus = { version = "0.10.0", features = ["process"] }
+lazy_static = "1"
+systemstat = "0.1"

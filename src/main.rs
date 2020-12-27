@@ -5,16 +5,14 @@ extern crate lazy_static;
 #[macro_use]
 extern crate log;
 
-use crate::net::Client;
 use crate::runtime::Runtime;
 use failure::Error;
 use flexi_logger::{DeferredNow, Logger};
+use futures::FutureExt;
 use log::Record;
 use std::thread;
 use std::time::{Duration, Instant};
-use futures::FutureExt;
 
-mod net;
 mod program;
 mod runtime;
 //mod prom;
@@ -55,7 +53,7 @@ async fn main() -> Result<()> {
         //)
         .start()?;
 
-    let client = Client::new(REMOTE).await?;
+    let client = alloy::tcp::AsyncClient::new(REMOTE).await?;
 
     for i in 1..2 {
         let before = Instant::now();

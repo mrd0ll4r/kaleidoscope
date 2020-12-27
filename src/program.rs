@@ -177,8 +177,8 @@ impl Program {
                 }
                 Err(e) => {
                     match e {
-                        broadcast::RecvError::Closed => break,
-                        broadcast::RecvError::Lagged(_) => {
+                        broadcast::error::RecvError::Closed => break,
+                        broadcast::error::RecvError::Lagged(_) => {
                             // TOOD
                             continue;
                         }

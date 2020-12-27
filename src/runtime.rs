@@ -1,4 +1,3 @@
-use crate::net::Client;
 use crate::program::Program;
 use crate::Result;
 use alloy::api::{SetRequest, SetRequestTarget, SubscriptionRequest};
@@ -8,7 +7,6 @@ use alloy::event::{
 };
 use alloy::{Address, Value};
 use failure::ResultExt;
-use futures::StreamExt;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -28,7 +26,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
-    pub(crate) async fn new(mut client: Client) -> Result<Runtime> {
+    pub(crate) async fn new(mut client: alloy::tcp::AsyncClient) -> Result<Runtime> {
         let configs = client.devices().await?;
         let mut values = HashMap::new();
         let events_counter = Arc::new(Mutex::new(0 as u64));
@@ -120,7 +118,7 @@ impl Runtime {
     }
 
     async fn subscribe_with_change(
-        client: &Client,
+        client: &alloy::tcp::AsyncClient,
         event_subscriptions: &HashMap<Address, EventFilter>,
         configs: &Vec<VirtualDeviceConfig>,
     ) -> Result<()> {
@@ -165,7 +163,7 @@ impl Runtime {
         values: Arc<Mutex<HashMap<Address, Value>>>,
         events_counter: Arc<Mutex<u64>>,
     ) {
-        while let Some(events) = incoming.next().await {
+        while let Some(events) = incoming.recv().await {
             // Update event counter
             {
                 let mut events_counter = events_counter.lock().await;
