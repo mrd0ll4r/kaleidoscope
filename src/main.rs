@@ -77,41 +77,46 @@ async fn main() -> Result<()> {
 
     let mut runtime = Runtime::new(client).await?;
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(2));
+    let mut print_ticker = tokio::time::interval(Duration::from_secs(2));
+    let mut tick_ticker = tokio::time::interval(Duration::from_millis(1));
     // First tick is free :o
-    let mut last_print = ticker.tick().await;
+    let mut last_print = print_ticker.tick().await;
+    tick_ticker.tick().await;
 
     let mut events_processed = runtime.events_processed().await;
     let mut total_time_avg = 0.0;
     let mut tick_time_avg = 0.0;
     let mut i = 1_u64;
     loop {
-        let before = Instant::now();
-        let inner_duration = runtime.tick().await?;
-        let time_taken = before.elapsed().as_micros() as f64;
-
-        total_time_avg += (time_taken - total_time_avg) / i as f64;
-        tick_time_avg += (inner_duration.as_micros() as f64 - tick_time_avg) / i as f64;
-
-        i += 1;
-
         futures::select! {
-            tick = ticker.tick().fuse() => {
-            let dur = tick.duration_since(last_print).as_secs_f64();
-            let current_events_processed = runtime.events_processed().await;
-            let events_diff = current_events_processed - events_processed;
-            println!(
-                "avg tick+send: {:6.2}µs, tick: {:6.2}µs, send: {:6.2}µs, received {:5} events/s, processed {:5} ticks/s",
-                total_time_avg, tick_time_avg, total_time_avg - tick_time_avg, (events_diff as f64 / dur) as u64, (i as f64 / dur) as u64
-            );
-            i = 1;
-            total_time_avg = 0.0;
-            tick_time_avg = 0.0;
-            last_print = tick;
-            events_processed = current_events_processed;
+            tick = tick_ticker.tick().fuse() => {
+                let before = Instant::now();
+                let inner_duration = runtime.tick().await?;
+                let time_taken = before.elapsed().as_micros() as f64;
+
+                total_time_avg += (time_taken - total_time_avg) / i as f64;
+                tick_time_avg += (inner_duration.as_micros() as f64 - tick_time_avg) / i as f64;
+
+                i += 1;
             },
+            tick = print_ticker.tick().fuse() => {
+                let dur = tick.duration_since(last_print).as_secs_f64();
+                let current_events_processed = runtime.events_processed().await;
+                let events_diff = current_events_processed - events_processed;
+                println!(
+                    "avg tick+send: {:6.2}µs, tick: {:6.2}µs, send: {:6.2}µs, received {:5} events/s, processed {:5} ticks/s",
+                    total_time_avg, tick_time_avg, total_time_avg - tick_time_avg, (events_diff as f64 / dur) as u64, (i as f64 / dur) as u64
+                );
+                i = 1;
+                total_time_avg = 0.0;
+                tick_time_avg = 0.0;
+                last_print = tick;
+                events_processed = current_events_processed;
+                },
             default => {},
         };
+
+        //tokio::time::sleep(std::time::Duration::from_micros(1000));
     }
 
     Ok(())
