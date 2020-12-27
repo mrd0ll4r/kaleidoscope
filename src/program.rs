@@ -93,9 +93,8 @@ impl Program {
             ctx.load(&program_source).exec()?;
 
             // check source version
-            let source_version: String = globals.get("SOURCE_VERSION")?;
-            println!("Source version: {}", source_version);
-            // TODO actually check
+            let source_version: u16 = globals.get("SOURCE_VERSION")?;
+            ensure!(source_version == VERSION, "source version mismatch");
 
             Ok(())
         })?;

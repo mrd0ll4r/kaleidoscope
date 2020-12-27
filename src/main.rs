@@ -4,6 +4,8 @@ extern crate lazy_static;
 //extern crate prometheus;
 #[macro_use]
 extern crate log;
+#[macro_use]
+extern crate failure;
 
 use crate::runtime::Runtime;
 use failure::Error;
