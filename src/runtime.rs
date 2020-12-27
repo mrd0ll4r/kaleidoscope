@@ -86,19 +86,17 @@ impl Runtime {
     }
 
     pub async fn tick(&mut self) -> Result<Duration> {
-        let values = Arc::new({ self.current_values.lock().await.clone() });
+        let values = Arc::new(self.current_values.lock().await.clone());
         let mut set_requests = Vec::new();
         let now = Instant::now();
         for program in &self.loaded_programs {
             program.inject_inputs(values.clone())?;
             program.process_events().await?;
             let outputs = program.tick(now)?;
-            outputs.into_iter().for_each(|(k, v)| {
-                set_requests.push(SetRequest {
-                    value: v,
-                    target: SetRequestTarget::Address(k),
-                })
-            })
+            set_requests.extend(outputs.into_iter().map(|(k, v)| SetRequest {
+                value: v,
+                target: SetRequestTarget::Address(k),
+            }));
         }
         let dur = now.elapsed();
 

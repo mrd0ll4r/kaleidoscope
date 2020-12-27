@@ -32,7 +32,7 @@ lazy_static! {
     pub static ref PERLIN: Perlin = Perlin::new();
 }
 
-const BUILTIN_SOURCE :&'static str = include_str!("builtin.lua");
+const BUILTIN_SOURCE: &'static str = include_str!("builtin.lua");
 
 fn address_in_use(virtual_devices: &Vec<VirtualDeviceConfig>, address: &Address) -> bool {
     virtual_devices
@@ -83,7 +83,9 @@ impl Program {
         lua.context(|ctx| -> Result<()> {
             let globals = ctx.globals();
 
-            ctx.load(BUILTIN_SOURCE).exec()?;
+            ctx.load(BUILTIN_SOURCE)
+                .exec()
+                .expect("unable to load builtin source");
 
             // Inject a bunch of constants after builtins were loaded, but before the program source
             // is loaded.
