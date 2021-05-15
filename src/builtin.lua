@@ -59,6 +59,22 @@ function map_to_value(from, to, x)
     return math.floor(map_range(from, to, LOW, HIGH, x))
 end
 
+function map_from_value(from, to, x)
+    return map_range(LOW, HIGH, from, to, x)
+end
+
+function map_value_to_temperature(x)
+    return map_from_value(-40,80,x)
+end
+
+function map_value_to_relative_humidity(x)
+    return map_from_value(0,100,x)
+end
+
+function absolute_humidity(temperature, humidity)
+    return (6.112*math.exp((17.67*temperature)/(temperature+243.5))*humidity*2.1674)/(273.15+temperature)
+end
+
 -- These are provided by the runtime during setup.
 alias_address = {}
 group_addresses = {}
