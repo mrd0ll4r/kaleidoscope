@@ -5,6 +5,10 @@ HIGH = 65535
 START = 123.45
 -- This is set before handling events.
 NOW = 123.45
+-- This is set before handling events.
+-- Contains the time of day in seconds since midnight...
+TIME_OF_DAY = 14*60*60 + 36*60 + 12
+
 
 -- now returns the time in seconds since the program epoch.
 function now()
