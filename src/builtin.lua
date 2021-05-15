@@ -112,7 +112,10 @@ end
 -- By calling tick() from within Lua and returning the table in just
 -- one function call we avoid one trip through the C FFI.
 function _tick(now)
-    --_output_values_by_address = {} -- We could do this, but it costs some performance...
+    -- This clears the previous tick's map.
+    -- It costs performance, but otherwise we cannot distinguish whether a program wrote a value
+    -- during this tick or some previous tick.
+    _output_values_by_address = {}
     tick(now)
     return _output_values_by_address
 end
