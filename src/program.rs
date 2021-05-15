@@ -5,11 +5,13 @@ use alloy::event::{
     EventFilterStrategy, EventKind,
 };
 use alloy::{Address, Value};
+use chrono::Timelike;
 use failure::err_msg;
 use itertools::Itertools;
 use noise::{NoiseFn, Perlin};
 use rlua::{Function, Lua, ToLua};
 use std::collections::{HashMap, HashSet};
+use std::fmt::{Debug, Formatter};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -60,6 +62,18 @@ pub struct Program {
     pub name: String,
 }
 
+impl Debug for Program {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Program")
+            .field("name", &self.name)
+            .field("priority", &self.priority)
+            .field("tick_enabled", &self.tick_enabled)
+            .field("inputs", &self.inputs)
+            .field("outputs", &self.outputs)
+            .finish()
+    }
+}
+
 impl Program {
     pub fn new<P: AsRef<Path>>(
         virtual_devices: &Vec<VirtualDeviceConfig>,
@@ -75,6 +89,7 @@ impl Program {
             .to_str()
             .ok_or_else(|| err_msg("invalid path?"))?
             .to_string();
+        debug!("loading program {}...", name);
         let program_source = fs::read_to_string(source_file)?;
         let program_epoch = Instant::now();
 
@@ -107,12 +122,7 @@ impl Program {
             current_values,
             program_epoch.elapsed().as_secs_f64(),
         )?;
-
-        // use whatever setup set up
-        println!("priority: {}", setup_values.priority);
-        println!("inputs: {:?}", setup_values.inputs);
-        println!("outputs: {:?}", setup_values.outputs);
-        println!("event_targets: {:?}", setup_values.event_targets);
+        debug!("set up program {}: {:?}", name, setup_values);
 
         // set up event stuff
         let registered_events: HashMap<Address, Vec<EventFilterEntry>> = setup_values
@@ -141,6 +151,7 @@ impl Program {
         let event_buffer = Arc::new(Mutex::new(Vec::new()));
         let task_event_buffer = event_buffer.clone();
         task::spawn(Self::handle_incoming_events(
+            name.clone(),
             event_channel,
             event_filters,
             task_event_buffer,
@@ -160,17 +171,24 @@ impl Program {
     }
 
     async fn handle_incoming_events(
+        program_name: String,
         mut bc_receiver: broadcast::Receiver<AddressedEvent>,
         registered_events: HashMap<Address, EventFilter>,
         event_buffer: Arc<Mutex<Vec<AddressedEvent>>>,
     ) {
+        debug!("{}: started incoming event handler", program_name);
         loop {
             let event = bc_receiver.recv().await;
+            debug!("{}: received event: {:?}", program_name, event);
             match event {
                 Ok(event) => {
                     let filter_for_address = registered_events.get(&event.address);
                     if let Some(filter) = filter_for_address {
                         if filter.matches(&event.event) {
+                            debug!(
+                                "{}: event {:?} matched, adding to buffer",
+                                program_name, event
+                            );
                             let mut event_buffer = event_buffer.lock().await;
                             event_buffer.push(event);
                         }
@@ -187,20 +205,32 @@ impl Program {
                 }
             }
         }
+        debug!("{}: stopped incoming event handler", program_name);
     }
 
     fn inject_inputs_unfiltered(
         lua: &rlua::Lua,
         values: HashMap<Address, Value>,
         now: f64,
+        time_of_day: u32,
     ) -> Result<()> {
         lua.context(|ctx| -> Result<()> {
             ctx.globals().set("input_values_by_address", values)?;
             ctx.globals().set("NOW", now)?;
+            ctx.globals().set("TIME_OF_DAY", time_of_day)?;
             Ok(())
         })?;
 
         Ok(())
+    }
+
+    /// Calculates the time of day.
+    /// TODO: when running many programs this might be expensive.
+    /// We could cache it and update once per second or so.
+    fn calculate_time_of_day() -> u32 {
+        let now = chrono::Local::now().time();
+
+        now.hour() * 60 * 60 + now.minute() * 60 + now.second()
     }
 
     pub fn inject_inputs(&self, values: Arc<HashMap<Address, Value>>) -> Result<()> {
@@ -215,6 +245,7 @@ impl Program {
             &self.lua,
             subscribed_inputs,
             self.program_epoch.elapsed().as_secs_f64(),
+            Self::calculate_time_of_day(),
         )
     }
 
@@ -368,7 +399,7 @@ impl Program {
             HashMap::new();
 
         // Inject inputs
-        Self::inject_inputs_unfiltered(lua, current_values, now)?;
+        Self::inject_inputs_unfiltered(lua, current_values, now, Self::calculate_time_of_day())?;
 
         // setup
         lua.context(|ctx| -> Result<()> {
@@ -561,6 +592,7 @@ impl Program {
     }
 }
 
+#[derive(Clone, Debug)]
 struct SetupValues {
     priority: u8,
     inputs: HashSet<Address>,
