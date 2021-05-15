@@ -1,21 +1,21 @@
 #[macro_use]
 extern crate lazy_static;
-//#[macro_use]
-//extern crate prometheus;
+#[macro_use]
+extern crate prometheus;
 #[macro_use]
 extern crate log;
 #[macro_use]
 extern crate failure;
 
 use crate::runtime::Runtime;
-use failure::Error;
+use failure::{Error, ResultExt};
 use flexi_logger::{DeferredNow, Logger};
-use futures::FutureExt;
 use log::Record;
 use std::thread;
 use std::time::{Duration, Instant};
 
 mod program;
+mod prom;
 mod runtime;
 //mod prom;
 
@@ -43,7 +43,7 @@ pub(crate) fn log_format(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    Logger::with_env_or_str("debug")
+    Logger::with_env_or_str("info")
         .format(log_format)
         //.log_to_file()
         //.directory("logs")
@@ -55,20 +55,23 @@ async fn main() -> Result<()> {
         //)
         .start()?;
 
+    info!("connecting...");
     let client = alloy::tcp::AsyncClient::new(REMOTE).await?;
 
-    for i in 1..2 {
+    info!("testing connection...");
+    for i in 1..4 {
         let before = Instant::now();
         client.ping().await?;
         let elapsed = before.elapsed();
         println!("ping {} took {}µs", i, elapsed.as_micros());
 
-        thread::sleep(Duration::from_secs(1))
+        thread::sleep(Duration::from_millis(250))
     }
 
+    info!("getting virtual device configurations...");
     let configs = client.devices().await?;
     for config in &configs {
-        println!(
+        debug!(
             "{:5} {:2} {:20} [{}]",
             config.address,
             if config.read_only { "R" } else { "RW" },
@@ -77,8 +80,14 @@ async fn main() -> Result<()> {
         );
     }
 
+    info!("setting up runtime...");
     let mut runtime = Runtime::new(client).await?;
 
+    info!("setting up prometheus...");
+    prom::start_prometheus("127.0.0.1:4343".parse().unwrap())
+        .context("unable to start prometheus")?;
+
+    info!("starting tick loop");
     let mut print_ticker = tokio::time::interval(Duration::from_secs(2));
     let mut tick_ticker = tokio::time::interval(Duration::from_millis(1));
     // First tick is free :o
