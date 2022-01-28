@@ -17,6 +17,7 @@ end
 
 -- These are provided by the runtime during setup
 function set_priority(p) end
+function set_slow_mode(slow_mode) end
 function add_input_alias(alias) end
 function add_output_alias(alias) end
 function add_output_group(group) end

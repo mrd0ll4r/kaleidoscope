@@ -59,6 +59,9 @@ This function should not be used to write outputs.
 In the context of `setup()`, a bunch of special functions can be called, which are not available later:
 
 - `set_priority(u8 <= 20)` sets the program's priority.
+- `set_slow_mode(bool)` marks whether this program should run in slow mode.
+    The default is false (i.e., fast mode).
+    See below for more information about slow mode and program execution.
 - `add_input_alias(string)` adds an alias to the inputs.
     This resolves the alias to its address and adds the numerical address to the program's outputs.
     It is checked whether the alias exists.
@@ -85,7 +88,7 @@ In the context of `setup()`, a bunch of special functions can be called, which a
         and `button_long_press` (which contains the number of seconds for which the button was pressed, as `u64`).
         All other events do not contain a value and `-1` will be passed to the handler.
 
-TODO callable programs, rename inputs/outputs, slow mode.
+TODO callable programs, rename inputs/outputs.
 
 #### Event Handlers
 
@@ -94,6 +97,12 @@ Programs do not have to work with events -- in particular, they should __not__ u
 of the address space.
 The Runtime maintains this view automatically and makes it available to programs through the `get_(address|alias)`
 functions, which are also much faster than event handlers.
+
+It is not possible to set output values from within event handlers (or rather,
+changes are only applied when `tick` runs next).
+All program variables, however, can be modified.
+For programs in slow mode, handling an event marks them to be executed in the
+current tick and resets the slow mode timer.
 
 Handling events is __slow__ in comparison to reading inputs and modifying outputs through `tick`.
 This is rooted in the complexity associated with moving events from Rust-space to Lua-space and calling in between the
@@ -105,7 +114,7 @@ To give two concrete examples:
     You read the temperature outside with a DHT22 sensor, so you can get a new value _at most_ every two seconds, not
     faster.
     The rate of `change` events in this case is low.
-    You should use events (or, TODO, slow mode).
+    You should use events and slow mode.
 - You have a program that mirrors all lighting from your living room's RGBW LED strips to your toilet's.
     You could either copy-paste your code for the living room and somehow ensure the same programs are always running
     for your toilet, or you could write a program that sets the toilet lights to whatever is currently set for the
@@ -127,8 +136,40 @@ The `tick` function can call other functions and do whatever Lua can do, but it 
 The Runtime keeps track of both the global Tick duration and `tick` durations for each program, which might be useful
 for debugging.
 
-TODO slow mode: It will be possible at some point to specify a "slow mode" for things that do not need to run at a high
-frequency. 
+#### Slow mode
+
+Usually programs are run at every tick.
+Slow mode programs are run every 1000 ticks or on event arrival.
+The reason for this is that some programs can probably deal with the added
+latency, which frees some performance for the programs that need to execute
+every tick.
+Events are still injected as soon as they arrive.
+If an event matches for a program in slow mode, the slow mode counter is reset
+and the program is run in the current tick.
+
+#### Overwriting Values, Order of Execution
+
+For every output address a priority-sorted list of programs writing to this
+output is maintained.
+On each tick, the runtime tries to find a minimal subset of programs to execute
+this tick in order to fill every output address with the value of the
+highest-priority program for this output, using a greedy algorithm:
+If, for any output, there is an unexecuted program that writes to this output
+with a higher priority than the assigned value (or no value is assigned yet),
+the program is run and its outputs are assigned.
+
+This could cause problems with slow mode programs, which "disappear" from the
+list of runnable functions for the 999 ticks in which they are not run.
+During this time, lower-priority programs could change the value, which would
+lead to visual glitches.
+The alternative to this would be basing occupation of an output address not on
+whether a program has written a value to it, but rather whether any enabled
+program has marked the address as its output.
+This causes other problems, for example with high-priority programs writing
+to many addresses, like stroboscopes or other global effects.
+These high-priority programs would then "hog" the output at all times.
+We'll have to see if this is actually an issue in practice.
+
 
 ### Builtins
 

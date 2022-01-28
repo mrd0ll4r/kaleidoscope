@@ -36,9 +36,7 @@ pub(crate) struct Runtime {
 
 impl Runtime {
     fn pre_tick(&mut self) {
-        self.loaded_programs
-            .iter()
-            .for_each(|p| p.executed_this_tick.set(false));
+        self.loaded_programs.iter().for_each(|p| p.reset_run());
         self.tick_values.iter_mut().for_each(|v| v.reset())
     }
 
@@ -72,8 +70,50 @@ impl Runtime {
 #[derive(Debug)]
 struct WrappedProgram {
     program: Program,
+    // This tracks how many ticks in the future we should run this program next.
+    // A value of zero indicates that it should be run this tick (or next tick, depending on
+    // where within the tick we are).
+    execute_in_ticks: Cell<u16>,
     executed_this_tick: Cell<bool>,
     enabled: Cell<bool>,
+}
+
+impl WrappedProgram {
+    fn mark_run(&self) {
+        self.executed_this_tick.set(true);
+    }
+
+    // This should be called once, pre-tick, for _every_ program.
+    // This will reset the executed bit and decrement the run-next-tick counter.
+    fn reset_run(&self) {
+        if self.executed_this_tick.get() {
+            if self.program.slow_mode {
+                self.execute_in_ticks.set(999);
+            } else {
+                self.execute_in_ticks.set(0);
+            }
+        } else {
+            // Programs are not guaranteed to be executed every tick, even if they're ready.
+            // Something with low priority could be left out.
+            // To avoid underflows, better check that counter first...
+            if self.execute_in_ticks.get() > 0 {
+                self.execute_in_ticks.set(self.execute_in_ticks.get() - 1);
+            }
+        }
+
+        self.executed_this_tick.set(false);
+    }
+
+    fn force_run_this_tick(&self) {
+        self.execute_in_ticks.set(0)
+    }
+
+    // Returns whether this program should be run during the current tick.
+    // A program should run if it's enabled, hasn't executed this tick yet, and is on the right
+    // tick count (for slow-mode programs).
+    fn should_run_this_tick(&self) -> bool {
+        self.enabled.get() && !self.executed_this_tick.get() && self.execute_in_ticks.get() == 0
+    }
 }
 
 #[derive(Debug)]
@@ -100,7 +140,7 @@ impl TickValue {
     fn get_highest_priority_non_executed_program(&self) -> Option<Rc<WrappedProgram>> {
         self.programs_for_this_value
             .iter()
-            .find(|p| !p.executed_this_tick.get())
+            .find(|p| p.should_run_this_tick())
             .map(|p| p.clone())
     }
 
@@ -210,8 +250,9 @@ impl Runtime {
             .map(|p| {
                 Rc::new(WrappedProgram {
                     program: p,
+                    execute_in_ticks: Cell::new(0),
                     executed_this_tick: Cell::new(false),
-                    enabled: Cell::new(false),
+                    enabled: Cell::new(true),
                 })
             })
             .collect();
@@ -266,10 +307,15 @@ impl Runtime {
         };
         let now = Instant::now();
 
-        // Handle events for all programs, regardless of whether their tick is enabled or whatnot
+        // Handle events for all programs, regardless of whether their tick is enabled or whatnot.
+        // Matching events "wakes up" programs in slow mode.
         for p in self.loaded_programs.iter() {
             match p.program.handle_incoming_events(events.clone()).await {
-                Ok(_) => {}
+                Ok(any_matched) => {
+                    if any_matched {
+                        p.force_run_this_tick()
+                    }
+                }
                 Err(err) => {
                     warn!(
                         "program {}: unable to apply events: {:?}",
@@ -300,7 +346,7 @@ impl Runtime {
                 }
                 Some(program) => {
                     program.program.inject_inputs().await?;
-                    program.executed_this_tick.set(true);
+                    program.mark_run();
                     let outputs = program.program.tick(now);
                     match outputs {
                         Ok(outputs) => {
@@ -321,10 +367,12 @@ impl Runtime {
                 }
             }
 
+            // Any programs left to run?
+            // This is potentially faster than iterating through the list of outputs.
             if self
                 .loaded_programs
                 .iter()
-                .find(|p| !p.executed_this_tick.get())
+                .find(|p| p.should_run_this_tick())
                 .is_none()
             {
                 debug!("all programs executed, finishing tick");

@@ -53,6 +53,7 @@ pub struct Program {
     pub(crate) outputs: HashSet<Address>,
     pub(crate) event_filters: HashMap<Address, EventFilter>,
     pub(crate) name: String,
+    pub(crate) slow_mode: bool,
 
     // Contains a view of the universe, but only with addresses that this program uses as inputs.
     // Is updated before each tick through events and then pushed to the lua side.
@@ -150,6 +151,7 @@ impl Program {
             program_epoch,
             priority: setup_values.priority,
             outputs: setup_values.outputs,
+            slow_mode: setup_values.slow_mode,
             tick_enabled: true,
             name,
             universe_view: Arc::new(Mutex::new(UniverseView::new_with_addresses(
@@ -162,9 +164,10 @@ impl Program {
     pub(crate) async fn handle_incoming_events(
         &self,
         events: Arc<VecDeque<AddressedEvent>>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         debug!("{}: applying events", self.name);
 
+        let mut any_matches = false;
         let mut universe_view = self.universe_view.lock().await;
         let mut event_buffer = self.event_buffer.lock().await;
 
@@ -181,6 +184,7 @@ impl Program {
                 if filter.matches(&event.event) {
                     debug!("{}: event {:?} matched, adding to buffer", self.name, event);
                     event_buffer.push_back(event.clone());
+                    any_matches = true;
                 }
             }
         }
@@ -190,7 +194,7 @@ impl Program {
             event_buffer.clear();
         }
 
-        Ok(())
+        Ok(any_matches)
     }
 
     async fn inject_inputs_unfiltered(
@@ -400,6 +404,7 @@ impl Program {
 
     async fn setup(lua: &Lua, universe: &UniverseConfig, now: f64) -> Result<SetupValues> {
         let mut priority: u8 = 0; // TODO use option
+        let mut slow_mode = false;
         let mut inputs: HashSet<Address> = HashSet::new();
         let mut outputs: HashSet<Address> = HashSet::new();
         let mut event_targets: HashMap<Address, Vec<(EventFilterEntry, String, String)>> =
@@ -453,6 +458,12 @@ impl Program {
                     Ok(())
                 })?;
                 globals.set("set_priority", set_priority)?;
+
+                let set_slow_mode = scope.create_function_mut(|_, p_slow_mode| {
+                    slow_mode = p_slow_mode;
+                    Ok(())
+                })?;
+                globals.set("set_slow_mode", set_slow_mode)?;
 
                 let add_input_address = scope.create_function_mut(|_, address: Address| {
                     must_have_address(&input_aliases, &address).map_err(rlua::Error::external)?;
@@ -605,6 +616,7 @@ impl Program {
             inputs,
             outputs,
             event_targets,
+            slow_mode,
         })
     }
 }
@@ -615,4 +627,5 @@ struct SetupValues {
     inputs: HashSet<Address>,
     outputs: HashSet<Address>,
     event_targets: HashMap<Address, Vec<(EventFilterEntry, String, String)>>,
+    slow_mode: bool,
 }
