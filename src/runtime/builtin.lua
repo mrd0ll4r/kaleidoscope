@@ -76,13 +76,22 @@ function absolute_humidity(temperature, humidity)
 end
 
 -- These are provided by the runtime during setup.
-alias_address = {}
+input_alias_address = {}
+output_alias_address = {}
 group_addresses = {}
 
-function alias_to_address(alias)
-    local addr = alias_address[alias]
+function input_alias_to_address(alias)
+    local addr = input_alias_address[alias]
     if addr == nil then
-        error("unknown alias: " .. alias)
+        error("unknown input alias: " .. alias)
+    end
+    return addr
+end
+
+function output_alias_to_address(alias)
+    local addr = output_alias_address[alias]
+    if addr == nil then
+        error("unknown output alias: " .. alias)
     end
     return addr
 end
@@ -99,7 +108,7 @@ end
 _output_values_by_address = {}
 
 function set_alias(alias, value)
-    _output_values_by_address[alias_to_address(alias)] = value
+    _output_values_by_address[output_alias_to_address(alias)] = value
 end
 
 function set_group(group, value)
@@ -126,7 +135,7 @@ end
 input_values_by_address = {}
 
 function get_alias(alias)
-    local addr = alias_to_address(alias)
+    local addr = input_alias_to_address(alias)
     local value = input_values_by_address[addr]
     if value == nil then
         error("invalid address: " .. addr)
@@ -138,11 +147,12 @@ end
 _event_handlers = {}
 
 -- Event type constants, keep synchronized with Rust and the readme!
-EVENT_TYPE_CHANGE = "change"
+EVENT_TYPE_UPDATE = "update"
 EVENT_TYPE_BUTTON_DOWN = "button_down"
 EVENT_TYPE_BUTTON_UP = "button_up"
 EVENT_TYPE_BUTTON_CLICKED = "button_clicked"
 EVENT_TYPE_BUTTON_LONG_PRESS = "button_long_press"
+EVENT_TYPE_ERROR = "error"
 
 -- This is called by the runtime to handle events.
 -- Do not modify, please.

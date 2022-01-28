@@ -1,34 +1,35 @@
+use crate::runtime::UniverseView;
 use crate::Result;
-use alloy::config::VirtualDeviceConfig;
+use alloy::config::{InputValue, UniverseConfig};
 use alloy::event::{
     AddressedEvent, ButtonEvent, ButtonEventFilter, EventFilter, EventFilterEntry, EventFilterKind,
     EventFilterStrategy, EventKind,
 };
-use alloy::{Address, Value};
+use alloy::{Address, OutputValue};
 use chrono::Timelike;
 use failure::err_msg;
 use itertools::Itertools;
 use noise::{NoiseFn, Perlin};
 use rlua::{Function, Lua, ToLua};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
+use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use std::{fs, mem};
-use tokio::sync::{broadcast, Mutex};
-use tokio::task;
+use tokio::sync::Mutex;
 
 /// Event type constants.
 /// Must be in sync with builtin.lua and README.md!
-const EVENT_TYPE_CHANGE: &str = "change";
+const EVENT_TYPE_UPDATE: &str = "update";
 const EVENT_TYPE_BUTTON_DOWN: &str = "button_down";
 const EVENT_TYPE_BUTTON_UP: &str = "button_up";
 const EVENT_TYPE_BUTTON_CLICKED: &str = "button_clicked";
 const EVENT_TYPE_BUTTON_LONG_PRESS: &str = "button_long_press";
+const EVENT_TYPE_ERROR: &str = "error";
 
 /// Runtime version.
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 lazy_static! {
     pub static ref PERLIN: Perlin = Perlin::new();
@@ -36,15 +37,9 @@ lazy_static! {
 
 const BUILTIN_SOURCE: &'static str = include_str!("builtin.lua");
 
-fn address_in_use(virtual_devices: &Vec<VirtualDeviceConfig>, address: &Address) -> bool {
-    virtual_devices
-        .iter()
-        .find(|c| c.address == *address)
-        .is_some()
-}
-
-fn must_have_address(virtual_devices: &Vec<VirtualDeviceConfig>, address: &Address) -> Result<()> {
-    match address_in_use(virtual_devices, address) {
+fn must_have_address(aliases: &HashMap<String, Address>, address: &Address) -> Result<()> {
+    let found = aliases.values().find(|v| **v == *address).is_some();
+    match found {
         true => Ok(()),
         false => Err(err_msg(format!("address not in use: {}", address))),
     }
@@ -52,14 +47,19 @@ fn must_have_address(virtual_devices: &Vec<VirtualDeviceConfig>, address: &Addre
 
 pub struct Program {
     lua: Lua,
-    event_buffer: Arc<Mutex<Vec<AddressedEvent>>>,
     program_epoch: Instant,
-    inputs: HashSet<Address>,
     tick_enabled: bool,
-    pub priority: u8,
-    pub outputs: HashSet<Address>,
-    pub registered_events: HashMap<Address, Vec<EventFilterEntry>>,
-    pub name: String,
+    pub(crate) priority: u8,
+    pub(crate) outputs: HashSet<Address>,
+    pub(crate) event_filters: HashMap<Address, EventFilter>,
+    pub(crate) name: String,
+
+    // Contains a view of the universe, but only with addresses that this program uses as inputs.
+    // Is updated before each tick through events and then pushed to the lua side.
+    universe_view: Arc<Mutex<UniverseView>>,
+
+    // Holds events the program has subscribed to.
+    event_buffer: Arc<Mutex<VecDeque<AddressedEvent>>>,
 }
 
 impl Debug for Program {
@@ -68,18 +68,17 @@ impl Debug for Program {
             .field("name", &self.name)
             .field("priority", &self.priority)
             .field("tick_enabled", &self.tick_enabled)
-            .field("inputs", &self.inputs)
             .field("outputs", &self.outputs)
+            .field("program_epoch", &self.program_epoch)
+            .field("event_filters", &self.event_filters)
             .finish()
     }
 }
 
 impl Program {
-    pub fn new<P: AsRef<Path>>(
-        virtual_devices: &Vec<VirtualDeviceConfig>,
-        current_values: HashMap<Address, Value>,
+    pub async fn new<P: AsRef<Path>>(
+        universe_config: &UniverseConfig,
         source_file: P,
-        event_channel: broadcast::Receiver<AddressedEvent>,
     ) -> Result<Program> {
         let lua = Lua::new();
         let name = source_file
@@ -104,7 +103,7 @@ impl Program {
 
             // Inject a bunch of constants after builtins were loaded, but before the program source
             // is loaded.
-            Self::inject_pre_load_constants(&ctx, program_epoch, virtual_devices)?;
+            Self::inject_pre_load_constants(&ctx, program_epoch, universe_config)?;
 
             // Load program source.
             ctx.load(&program_source).exec()?;
@@ -116,12 +115,8 @@ impl Program {
             Ok(())
         })?;
 
-        let setup_values = Self::setup(
-            &lua,
-            virtual_devices,
-            current_values,
-            program_epoch.elapsed().as_secs_f64(),
-        )?;
+        let setup_values =
+            Self::setup(&lua, universe_config, program_epoch.elapsed().as_secs_f64()).await?;
         debug!("set up program {}: {:?}", name, setup_values);
 
         // set up event stuff
@@ -148,73 +143,65 @@ impl Program {
                 )
             })
             .collect();
-        let event_buffer = Arc::new(Mutex::new(Vec::new()));
-        let task_event_buffer = event_buffer.clone();
-        task::spawn(Self::handle_incoming_events(
-            name.clone(),
-            event_channel,
-            event_filters,
-            task_event_buffer,
-        ));
 
         Ok(Program {
             lua,
-            event_buffer,
+            event_filters,
             program_epoch,
             priority: setup_values.priority,
             outputs: setup_values.outputs,
-            inputs: setup_values.inputs,
             tick_enabled: true,
-            registered_events,
             name,
+            universe_view: Arc::new(Mutex::new(UniverseView::new_with_addresses(
+                &setup_values.inputs.into_iter().collect(),
+            ))),
+            event_buffer: Default::default(),
         })
     }
 
-    async fn handle_incoming_events(
-        program_name: String,
-        mut bc_receiver: broadcast::Receiver<AddressedEvent>,
-        registered_events: HashMap<Address, EventFilter>,
-        event_buffer: Arc<Mutex<Vec<AddressedEvent>>>,
-    ) {
-        debug!("{}: started incoming event handler", program_name);
-        loop {
-            let event = bc_receiver.recv().await;
-            debug!("{}: received event: {:?}", program_name, event);
-            match event {
-                Ok(event) => {
-                    let filter_for_address = registered_events.get(&event.address);
-                    if let Some(filter) = filter_for_address {
-                        if filter.matches(&event.event) {
-                            debug!(
-                                "{}: event {:?} matched, adding to buffer",
-                                program_name, event
-                            );
-                            let mut event_buffer = event_buffer.lock().await;
-                            event_buffer.push(event);
-                        }
-                    }
-                }
-                Err(e) => {
-                    match e {
-                        broadcast::error::RecvError::Closed => break,
-                        broadcast::error::RecvError::Lagged(_) => {
-                            // TOOD
-                            continue;
-                        }
-                    }
+    pub(crate) async fn handle_incoming_events(
+        &self,
+        events: Arc<VecDeque<AddressedEvent>>,
+    ) -> Result<()> {
+        debug!("{}: applying events", self.name);
+
+        let mut universe_view = self.universe_view.lock().await;
+        let mut event_buffer = self.event_buffer.lock().await;
+
+        for event in events.iter() {
+            debug!("{}: applying event: {:?}", self.name, event);
+            if universe_view.has_address(event.address) {
+                universe_view
+                    .apply_event(event)
+                    .expect("unable to apply event to universe view")
+            }
+
+            let filter_for_address = self.event_filters.get(&event.address);
+            if let Some(filter) = filter_for_address {
+                if filter.matches(&event.event) {
+                    debug!("{}: event {:?} matched, adding to buffer", self.name, event);
+                    event_buffer.push_back(event.clone());
                 }
             }
         }
-        debug!("{}: stopped incoming event handler", program_name);
+
+        if !event_buffer.is_empty() {
+            self.inject_events(&event_buffer).await?;
+            event_buffer.clear();
+        }
+
+        Ok(())
     }
 
-    fn inject_inputs_unfiltered(
-        lua: &rlua::Lua,
-        values: HashMap<Address, Value>,
+    async fn inject_inputs_unfiltered(
+        lua: &Lua,
+        universe_view: Arc<Mutex<UniverseView>>,
         now: f64,
         time_of_day: u32,
     ) -> Result<()> {
+        let values = universe_view.lock().await.clone();
         lua.context(|ctx| -> Result<()> {
+            let values = values.to_lua(ctx)?;
             ctx.globals().set("input_values_by_address", values)?;
             ctx.globals().set("NOW", now)?;
             ctx.globals().set("TIME_OF_DAY", time_of_day)?;
@@ -230,32 +217,22 @@ impl Program {
     fn calculate_time_of_day() -> u32 {
         let now = chrono::Local::now().time();
 
-        now.hour() * 60 * 60 + now.minute() * 60 + now.second()
+        let res = now.hour() * 60 * 60 + now.minute() * 60 + now.second();
+        debug!("calculated time of day as {}", res);
+        res
     }
 
-    pub fn inject_inputs(&self, values: Arc<HashMap<Address, Value>>) -> Result<()> {
-        // TODO use filter_map?
-        let subscribed_inputs: HashMap<Address, Value> = values
-            .iter()
-            .filter(|(k, _)| self.inputs.contains(*k))
-            .map(|(k, v)| (*k, *v))
-            .collect();
-
+    pub async fn inject_inputs(&self) -> Result<()> {
         Self::inject_inputs_unfiltered(
             &self.lua,
-            subscribed_inputs,
+            self.universe_view.clone(),
             self.program_epoch.elapsed().as_secs_f64(),
             Self::calculate_time_of_day(),
         )
+        .await
     }
 
-    pub async fn process_events(&self) -> Result<()> {
-        // Get events
-        let events = {
-            let buf = &mut *self.event_buffer.lock().await;
-            mem::take(buf)
-        };
-
+    async fn inject_events(&self, events: &VecDeque<AddressedEvent>) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -267,23 +244,48 @@ impl Program {
                 format!(
                     "{} {}",
                     e.address,
-                    match e.event.inner {
-                        EventKind::Change { new_value } => {
-                            format!("{} {}", EVENT_TYPE_CHANGE, new_value)
-                        }
-                        EventKind::Button(inner) => {
+                    match &e.event.inner {
+                        Ok(inner) => {
                             match inner {
-                                ButtonEvent::Up => format!("{}", EVENT_TYPE_BUTTON_UP),
-                                ButtonEvent::Down => format!("{}", EVENT_TYPE_BUTTON_DOWN),
-                                ButtonEvent::Clicked { duration } => format!(
-                                    "{} {}",
-                                    EVENT_TYPE_BUTTON_CLICKED,
-                                    duration.as_secs_f64()
-                                ),
-                                ButtonEvent::LongPress { seconds } => {
-                                    format!("{} {}", EVENT_TYPE_BUTTON_LONG_PRESS, seconds)
+                                EventKind::Update { new_value } => {
+                                    format!(
+                                        "{} {}",
+                                        EVENT_TYPE_UPDATE,
+                                        match new_value {
+                                            InputValue::Binary(b) => {
+                                                format!("{}", b)
+                                            }
+                                            InputValue::Temperature(t) => {
+                                                format!("{}", t)
+                                            }
+                                            InputValue::Humidity(h) => {
+                                                format!("{}", h)
+                                            }
+                                            InputValue::Pressure(p) => {
+                                                format!("{}", p)
+                                            }
+                                            InputValue::Continuous(c) => {
+                                                format!("{}", c)
+                                            }
+                                        }
+                                    )
                                 }
+                                EventKind::Button(inner) => match inner {
+                                    ButtonEvent::Up => format!("{}", EVENT_TYPE_BUTTON_UP),
+                                    ButtonEvent::Down => format!("{}", EVENT_TYPE_BUTTON_DOWN),
+                                    ButtonEvent::Clicked { duration } => format!(
+                                        "{} {}",
+                                        EVENT_TYPE_BUTTON_CLICKED,
+                                        duration.as_secs_f64()
+                                    ),
+                                    ButtonEvent::LongPress { seconds } => {
+                                        format!("{} {}", EVENT_TYPE_BUTTON_LONG_PRESS, seconds)
+                                    }
+                                },
                             }
+                        }
+                        Err(e) => {
+                            format!("{} {}", EVENT_TYPE_ERROR, e)
                         }
                     }
                 )
@@ -303,36 +305,35 @@ impl Program {
         Ok(())
     }
 
-    fn raw_tick(&self, now: Instant) -> Result<HashMap<Address, Value>> {
+    fn raw_tick(&self, now: Instant) -> Result<HashMap<Address, OutputValue>> {
         if !self.tick_enabled {
             return Ok(HashMap::new());
         }
 
         let output_values_by_address =
-            self.lua.context(|ctx| -> Result<HashMap<Address, Value>> {
-                let globals = ctx.globals();
+            self.lua
+                .context(|ctx| -> Result<HashMap<Address, OutputValue>> {
+                    let globals = ctx.globals();
 
-                let now = now.duration_since(self.program_epoch).as_secs_f64();
-                let tick: Function = globals.get("_tick")?;
+                    let now = now.duration_since(self.program_epoch).as_secs_f64();
+                    let tick: Function = globals.get("_tick")?;
 
-                let output_values_by_address: HashMap<Address, Value> = tick.call(now)?;
+                    let output_values_by_address: HashMap<Address, OutputValue> = tick.call(now)?;
 
-                Ok(output_values_by_address)
-            })?;
+                    Ok(output_values_by_address)
+                })?;
 
         Ok(output_values_by_address)
     }
 
-    pub fn tick(&self, now: Instant) -> Result<HashMap<Address, Value>> {
-        let outputs = self.raw_tick(now)?;
-
-        Ok(outputs)
+    pub fn tick(&self, now: Instant) -> Result<HashMap<Address, OutputValue>> {
+        self.raw_tick(now)
     }
 
     fn inject_pre_load_constants(
         ctx: &rlua::Context,
         program_epoch: Instant,
-        virtual_devices: &Vec<VirtualDeviceConfig>,
+        universe: &UniverseConfig,
     ) -> Result<()> {
         let globals = ctx.globals();
 
@@ -342,12 +343,22 @@ impl Program {
         globals.set("KALEIDOSCOPE_VERSION", VERSION)?;
 
         // Inject translations for aliases and groups.
-        let alias_address = ctx.create_table()?;
-        for vdev in virtual_devices {
-            alias_address.set(vdev.alias.clone(), vdev.address)?;
+        let input_aliases = ctx.create_table()?;
+        let output_aliases = ctx.create_table()?;
+        for cfg in &universe.devices {
+            for input in cfg.inputs.iter() {
+                input_aliases.set(input.alias.clone(), input.address)?;
+            }
+            for output in cfg.outputs.iter() {
+                input_aliases.set(output.alias.clone(), output.address)?;
+                output_aliases.set(output.alias.clone(), output.address)?;
+            }
         }
-        globals.set("alias_address", alias_address)?;
+        globals.set("input_alias_address", input_aliases)?;
+        globals.set("output_alias_address", output_aliases)?;
 
+        // TODO tags
+        /*
         let group_addresses = ctx.create_table()?;
         let groups: Vec<String> = virtual_devices
             .iter()
@@ -366,6 +377,7 @@ impl Program {
             )?;
         }
         globals.set("group_addresses", group_addresses)?;
+         */
 
         // Inject Perlin noise functions.
         globals.set(
@@ -386,20 +398,41 @@ impl Program {
         Ok(())
     }
 
-    fn setup(
-        lua: &Lua,
-        virtual_devices: &Vec<VirtualDeviceConfig>,
-        current_values: HashMap<Address, Value>,
-        now: f64,
-    ) -> Result<SetupValues> {
+    async fn setup(lua: &Lua, universe: &UniverseConfig, now: f64) -> Result<SetupValues> {
         let mut priority: u8 = 0; // TODO use option
         let mut inputs: HashSet<Address> = HashSet::new();
         let mut outputs: HashSet<Address> = HashSet::new();
         let mut event_targets: HashMap<Address, Vec<(EventFilterEntry, String, String)>> =
             HashMap::new();
+        let output_aliases: HashMap<_, _> = universe
+            .devices
+            .iter()
+            .flat_map(|d| &d.outputs)
+            .map(|output| (output.alias.clone(), output.address))
+            .collect();
+        let input_aliases: HashMap<_, _> = universe
+            .devices
+            .iter()
+            .flat_map(|dev| {
+                dev.inputs
+                    .iter()
+                    .map(|input| (input.alias.clone(), input.address))
+            })
+            .chain(universe.devices.iter().flat_map(|dev| {
+                dev.outputs
+                    .iter()
+                    .map(|output| (output.alias.clone(), output.address))
+            }))
+            .collect();
 
         // Inject inputs
-        Self::inject_inputs_unfiltered(lua, current_values, now, Self::calculate_time_of_day())?;
+        Self::inject_inputs_unfiltered(
+            lua,
+            Arc::new(Mutex::new(UniverseView::new_from_universe_config(universe))),
+            now,
+            Self::calculate_time_of_day(),
+        )
+        .await?;
 
         // setup
         lua.context(|ctx| -> Result<()> {
@@ -422,14 +455,8 @@ impl Program {
                 globals.set("set_priority", set_priority)?;
 
                 let add_input_address = scope.create_function_mut(|_, address: Address| {
-                    must_have_address(&virtual_devices, &address).map_err(rlua::Error::external)?;
+                    must_have_address(&input_aliases, &address).map_err(rlua::Error::external)?;
 
-                    if inputs.contains(&address) {
-                        return Err(rlua::Error::external(format!(
-                            "duplicate input address: {}",
-                            address
-                        )));
-                    }
                     inputs.insert(address);
 
                     Ok(())
@@ -437,27 +464,20 @@ impl Program {
                 globals.set("add_input_address", add_input_address)?;
 
                 let add_input_alias = scope.create_function(|ctx, alias: String| {
-                    let vdev = virtual_devices
-                        .iter()
-                        .find(|c| *c.alias == alias)
-                        .ok_or_else(|| {
-                            rlua::Error::external(format!("unknown alias: {}", alias))
-                        })?;
+                    let addr = *input_aliases.get(&alias).ok_or_else(|| {
+                        rlua::Error::external(format!("unknown alias: {}", alias))
+                    })?;
 
-                    // Wow... we call from Rust into Lua to call into Rust again, to make the borrow
-                    // checker happy.
                     let add_input_address: Function = ctx.globals().get("add_input_address")?;
-                    add_input_address.call(vdev.address)?;
+                    add_input_address.call(addr)?;
 
                     Ok(())
                 })?;
                 globals.set("add_input_alias", add_input_alias)?;
 
                 let add_output_address = scope.create_function_mut(|_, address: Address| {
-                    must_have_address(&virtual_devices, &address).map_err(rlua::Error::external)?;
+                    must_have_address(&output_aliases, &address).map_err(rlua::Error::external)?;
 
-                    // We don't check for duplicate output addresses, because someone could use both a group
-                    // and individual devices from that group.
                     outputs.insert(address);
 
                     Ok(())
@@ -465,20 +485,19 @@ impl Program {
                 globals.set("add_output_address", add_output_address)?;
 
                 let add_output_alias = scope.create_function(|ctx, alias: String| {
-                    let vdev = virtual_devices
-                        .iter()
-                        .find(|c| *c.alias == alias)
-                        .ok_or_else(|| {
-                            rlua::Error::external(format!("unknown alias: {}", alias))
-                        })?;
+                    let addr = *output_aliases.get(&alias).ok_or_else(|| {
+                        rlua::Error::external(format!("unknown alias: {}", alias))
+                    })?;
 
                     let add_output_address: Function = ctx.globals().get("add_output_address")?;
-                    add_output_address.call(vdev.address)?;
+                    add_output_address.call(addr)?;
 
                     Ok(())
                 })?;
                 globals.set("add_output_alias", add_output_alias)?;
 
+                /*
+                // TODO tags
                 let add_output_group = scope.create_function(|ctx, group: String| {
                     let addresses: Vec<Address> = virtual_devices
                         .iter()
@@ -498,16 +517,14 @@ impl Program {
                     Ok(())
                 })?;
                 globals.set("add_output_group", add_output_group)?;
+                 */
 
                 let add_event_subscription = scope.create_function_mut(
                     |ctx, (alias, type_name, target): (String, String, String)| {
                         // Check if alias exists.
-                        let vdev = virtual_devices
-                            .iter()
-                            .find(|c| *c.alias == alias)
-                            .ok_or_else(|| {
-                                rlua::Error::external(format!("unknown alias: {}", alias))
-                            })?;
+                        let address = *input_aliases.get(&alias).ok_or_else(|| {
+                            rlua::Error::external(format!("unknown alias: {}", alias))
+                        })?;
 
                         // Check if target function exists.
                         ctx.globals().get::<_, Function>(target.clone())?;
@@ -515,7 +532,7 @@ impl Program {
                         // "Parse" filter.
                         let filter_entry = EventFilterEntry::Kind {
                             kind: match type_name.as_str() {
-                                EVENT_TYPE_CHANGE => EventFilterKind::Change,
+                                EVENT_TYPE_UPDATE => EventFilterKind::Update,
                                 EVENT_TYPE_BUTTON_UP => EventFilterKind::Button {
                                     filter: ButtonEventFilter::Up,
                                 },
@@ -537,7 +554,7 @@ impl Program {
                             },
                         };
 
-                        event_targets.entry(vdev.address).or_default().push((
+                        event_targets.entry(address).or_default().push((
                             filter_entry,
                             type_name,
                             target.clone(),

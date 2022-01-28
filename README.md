@@ -144,7 +144,7 @@ These are:
 - `noise4d(f64, f64, f64, f64) -> f64` computes 4D Perlin noise in `[-1,1]`.
     This is implemented in Rust and slower than the 3D version.
 
-The following are implemented in Lua and can be found in [src/builtin.lua](src/builtin.lua):
+The following are implemented in Lua and can be found in [src/builtin.lua](src/runtime/builtin.lua):
 
 - `now() -> f64` gets the time in seconds since the program epoch.
 - `clamp(from: numer, to: number, x: number) -> number` clamps `x` to `[from, to]`. 
@@ -164,8 +164,8 @@ The following are implemented in Lua and can be found in [src/builtin.lua](src/b
 - `get_alias(alias) -> u16` gets the value of the device at `alias`.
     Note that this is the most-up-to-date value from before the Tick was started.
     Specifically, values `set_` by other programs are not visible during the current tick.
-- `EVENT_TYPE_CHANGE`, `EVENT_TYPE_BUTTON_DOWN`, `EVENT_TYPE_BUTTON_UP`, `EVENT_TYPE_BUTTON_CLICKED`, and
-    `EVENT_TYPE_BUTTON_LONG_PRESS` are string constants for the event types.
+- `EVENT_TYPE_UPDATE`, `EVENT_TYPE_BUTTON_DOWN`, `EVENT_TYPE_BUTTON_UP`, `EVENT_TYPE_BUTTON_CLICKED`, 
+    `EVENT_TYPE_ERROR`, and `EVENT_TYPE_BUTTON_LONG_PRESS` are string constants for the event types.
 
 ## Example Programs
 
