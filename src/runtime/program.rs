@@ -1,3 +1,4 @@
+use crate::runtime::globals::DeltaTable;
 use crate::runtime::UniverseView;
 use crate::Result;
 use alloy::config::{InputValue, UniverseConfig};
@@ -159,6 +160,29 @@ impl Program {
             ))),
             event_buffer: Default::default(),
         })
+    }
+
+    pub(crate) fn get_global_deltas(&self) -> Result<DeltaTable> {
+        self.lua.context(|ctx| -> Result<DeltaTable> {
+            let deltas = ctx.globals().get("_global_deltas")?;
+            Ok(deltas)
+        })
+    }
+
+    pub(crate) fn update_globals(&self, delta_table: &DeltaTable) -> Result<()> {
+        debug!("{}: updating globals", self.name);
+
+        // Call distributor
+        self.lua.context(|ctx| -> Result<()> {
+            let globals = ctx.globals();
+            let handler: Function = globals.get("_update_globals")?;
+
+            handler.call(delta_table.to_lua(ctx))?;
+
+            Ok(())
+        })?;
+
+        Ok(())
     }
 
     pub(crate) async fn handle_incoming_events(

@@ -34,6 +34,42 @@ function noise3d(x, y, z) return 0.0 end
 
 function noise3d(x, y, z, t) return 0.0 end
 
+-- Provided by the runtime:
+-- Functions to access global, shared values.
+_globals = {}
+function get_global(key)
+    return _globals[key]
+end
+
+-- The deltas to global values are picked up before processing events, from all
+-- loaded programs.
+-- They are then aggregated and redistributed to all loaded programs, before
+-- processing events.
+-- This is probably expensive. Don't set globals too often, I guess...
+-- If multiple programs update the same global during the same tick it's
+-- unspecified which value will be propagated for the next tick.
+-- In particular, this can lead to inconsistent state between programs.
+_global_deltas = {}
+function set_global(key, value)
+    assert(type(key) == "string", "global keys must be strings")
+    value_type = type(value)
+    assert(value_type == "string"
+        or value_type == "number"
+        or value_type == "integer"
+        or value_type == "boolean"
+        or value_type == "nil",
+        "global values must be of type string, number, integer, boolean, or nil")
+    _globals[key] = value
+    _global_deltas[key] = value
+end
+
+-- This is called by the runtime before events are processed.
+function _update_globals(new_values)
+    _global_deltas = {}
+    for k,v in pairs(new_values) do
+        _globals[k] = v
+    end
+end
 
 -- clamp clamps x to [from, to]
 function clamp(from, to, x)
@@ -211,51 +247,3 @@ function _handle_one_arg_event(address, typ, arg)
         end
     end
 end
-
---[[
-function tablelength(T)
-    local count = 0
-    for _ in pairs(T) do count = count + 1 end
-    return count
-end
-
-function dump(o)
-    if type(o) == 'table' then
-        local s = '{ '
-        for k, v in pairs(o) do
-            if type(k) ~= 'number' then k = '"' .. k .. '"' end
-            s = s .. '[' .. k .. '] = ' .. dump(v) .. ','
-        end
-        return s .. '} '
-    else
-        return tostring(o)
-    end
-end
-
--- These are alternative implementation for the event handling to try out some things.
--- They did not perform...
-function _handle_events_vec_thingy(events)
-    for j, event in ipairs(events) do
-        --print(event,dump(event))
-        --print(event:has_value())
-        if not event:has_value() then
-            --print(event:address(), event:kind())
-            _handle_no_arg_event(event:address(), event:kind())
-        else
-            --print(event:address(), event:kind(), event:value())
-            _handle_one_arg_event(event:address(), event:kind(), event:value())
-        end
-    end
-end
-
-function _handle_events_vec(events)
-    for j, event in ipairs(events) do
-        --print(event,dump(event))
-        if tablelength(event) == 2 then
-            _handle_no_arg_event(tonumber(event[1]), event[2])
-        else
-            _handle_one_arg_event(tonumber(event[1]), event[2], tonumber(event[3]))
-        end
-    end
-end
-]]--

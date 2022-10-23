@@ -1,3 +1,4 @@
+use crate::runtime::globals::DeltaTable;
 use crate::runtime::program::Program;
 use crate::runtime::UniverseView;
 use crate::Result;
@@ -296,9 +297,40 @@ impl Runtime {
 
     pub async fn tick(&mut self) -> Result<Duration> {
         debug!("starting tick");
-        // Clear flags and computed values
+        // Clear flags and computed values.
         self.pre_tick();
 
+        // Collect updates to globals from all programs.
+        let mut deltas = HashMap::new();
+        for p in self.loaded_programs.iter() {
+            match p.program.get_global_deltas() {
+                Ok(d) => deltas.extend(d.into_iter()),
+                Err(err) => {
+                    warn!(
+                        "program {}: unable to get global deltas: {:?}",
+                        p.program.name, err
+                    )
+                }
+            }
+        }
+
+        // Update globals if there was any delta.
+        if !deltas.is_empty() {
+            let dt = DeltaTable::from_map(deltas);
+            for p in self.loaded_programs.iter() {
+                match p.program.update_globals(&dt) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            "program {}: unable to update globals: {:?}",
+                            p.program.name, err
+                        )
+                    }
+                }
+            }
+        }
+
+        // Collect events.
         let events = {
             let mut buf = self.event_buffer.lock().await;
             let buf_cloned = buf.clone();

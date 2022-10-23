@@ -6,6 +6,7 @@ use failure::err_msg;
 use rlua::{Context, ToLua, Value};
 use std::collections::HashMap;
 
+mod globals;
 mod program;
 pub mod runtime;
 
