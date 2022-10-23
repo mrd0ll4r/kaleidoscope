@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use alloy::tcp::AsyncClient;
 use failure::{Error, ResultExt};
-use flexi_logger::{DeferredNow, Logger};
+use flexi_logger::{DeferredNow, Logger, LoggerHandle, TS_DASHES_BLANK_COLONS_DOT_BLANK};
 use log::Record;
 
 use crate::runtime::runtime::Runtime;
@@ -24,7 +24,7 @@ const REMOTE: &str = "127.0.0.1:3030";
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
-pub(crate) fn log_format(
+fn log_format(
     w: &mut dyn std::io::Write,
     now: &mut DeferredNow,
     record: &Record,
@@ -32,7 +32,7 @@ pub(crate) fn log_format(
     write!(
         w,
         "[{}] {} [{}] {}:{}: {}",
-        now.now().format("%Y-%m-%d %H:%M:%S%.6f %:z"),
+        now.format(TS_DASHES_BLANK_COLONS_DOT_BLANK),
         record.level(),
         record.metadata().target(),
         //record.module_path().unwrap_or("<unnamed>"),
@@ -42,19 +42,19 @@ pub(crate) fn log_format(
     )
 }
 
+pub fn set_up_logging() -> std::result::Result<LoggerHandle, Box<dyn std::error::Error>> {
+    let logger = Logger::try_with_env_or_str("info")?
+        .use_utc()
+        .format(log_format);
+
+    let handle = logger.start()?;
+
+    Ok(handle)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    Logger::with_env_or_str("info")
-        .format(log_format)
-        //.log_to_file()
-        //.directory("logs")
-        //.duplicate_to_stderr(Duplicate::All)
-        //.rotate(
-        //    Criterion::Size(100_000_000),
-        //    Naming::Timestamps,
-        //    Cleanup::KeepLogFiles(10),
-        //)
-        .start()?;
+    set_up_logging().unwrap();
 
     info!("connecting...");
     let (client, push_receiver) = alloy::tcp::AsyncClient::new(REMOTE).await?;

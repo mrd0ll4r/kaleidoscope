@@ -1,31 +1,31 @@
 [package]
 name = "kaleidoscope"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Leo Balduf <leobalduf@gmail.com>"]
 edition = "2021"
 
 [dependencies]
 #alloy = {git = "https://github.com/mrd0ll4r/alloy"}
-alloy = {path = "../alloy"}
-failure = { version = "0.1", features = ["std","backtrace"] }
-log = { version = "0.4", features = ["std","serde"] }
-flexi_logger = { version = "0.16", features = ["compress"] }
+alloy = { path = "../alloy" }
+failure = { version = "0.1", features = ["std", "backtrace"] }
+log = { version = "0.4", features = ["std", "serde"] }
+flexi_logger = { version = "0.24" }
 #serde = {version="1.0.104",features=["derive"]}
 #serde_json = "1.0.46"
-itertools = "0.9"
+itertools = "0.10"
 statistical = "1.0.0"
 
 # Tokio, Lua, Runtime
-tokio = { version = "1", features = ["rt-multi-thread","macros","sync","net","time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
 tokio-stream = "0.1"
 futures = "0.3"
 interpolation = "0.2"
-noise = "0.7"
-rlua = "0.17"
+noise = "0.8"
+rlua = "0.19"
 chrono = "0.4"
 
 # Prometheus
-prometheus_exporter = "0.8"
-prometheus = { version = "0.11.0", features = ["process"] }
+prometheus_exporter = "0.8.5"
+prometheus = { version = "0.13.0", features = ["process"] }
 lazy_static = "1"
-systemstat = "0.1.10"
+systemstat = "0.2"

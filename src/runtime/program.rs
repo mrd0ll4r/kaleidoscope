@@ -33,7 +33,7 @@ const EVENT_TYPE_ERROR: &str = "error";
 const VERSION: u16 = 2;
 
 lazy_static! {
-    pub static ref PERLIN: Perlin = Perlin::new();
+    pub static ref PERLIN: Perlin = Perlin::new(0);
 }
 
 const BUILTIN_SOURCE: &'static str = include_str!("builtin.lua");
