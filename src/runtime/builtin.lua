@@ -6,9 +6,9 @@ START = 123.45
 -- This is set before handling events.
 NOW = 123.45
 -- This is set before handling events.
--- Contains the time of day in seconds since midnight...
+-- Contains the time of day in seconds since midnight.
+-- This example value is 14:36:12.
 TIME_OF_DAY = 14*60*60 + 36*60 + 12
-
 
 -- now returns the time in seconds since the program epoch.
 function now()
@@ -69,6 +69,33 @@ function _update_globals(new_values)
     for k,v in pairs(new_values) do
         _globals[k] = v
     end
+end
+
+
+PROGRAM_ENABLE_SIGNAL = 1
+PROGRAM_DISABLE_SIGNAL = 2
+PROGRAM_ENABLE_TOGGLE_SIGNAL = 3
+
+_program_enable_deltas = {}
+function program_enable(program_name)
+    assert(type(program_name) == "string", "program names must be strings")
+    _program_enable_deltas[program_name] = PROGRAM_ENABLE_SIGNAL
+end
+
+function program_disable(program_name)
+    assert(type(program_name) == "string", "program names must be strings")
+    _program_enable_deltas[program_name] = PROGRAM_DISABLE_SIGNAL
+end
+
+function program_enable_toggle(program_name)
+    assert(type(program_name) == "string", "program names must be strings")
+    _program_enable_deltas[program_name] = PROGRAM_ENABLE_TOGGLE_SIGNAL
+end
+
+function _get_program_enable_deltas()
+    deltas = _program_enable_deltas
+    _program_enable_deltas = {}
+    return deltas
 end
 
 -- clamp clamps x to [from, to]

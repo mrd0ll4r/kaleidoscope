@@ -25,6 +25,7 @@ function setup()
 end
 
 function handle_down(address, _typ)
+    program_enable('lichterketten')
     ketten_enabled = not ketten_enabled
     if not ketten_enabled then
         light_mode = mode_night

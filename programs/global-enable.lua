@@ -2,8 +2,10 @@ SOURCE_VERSION = 2
 
 -- Constants
 local global_enable_long_press_seconds = 3
-local default = false
+local default = true
 local global_name = "global_enable"
+local programs_to_turn_off = {'kitchen-light', 'bug-catcher', 'klo-light', 'lichterketten', 'spoider', 'party-light', 'putzlicht'}
+local programs_to_turn_on = {'kitchen-light', 'bug-catcher', 'klo-light', 'lichterketten', 'spoider'}
 
 -- Variables
 local value = default
@@ -21,7 +23,16 @@ end
 function handle_long_press(address, _typ, duration)
     if address == button_front_door_address and duration == global_enable_long_press_seconds then
         value = not value
-        set_global(global_name, value)
+        if value then
+            for _, p in ipairs(programs_to_turn_on) do
+                program_enable(p)
+            end
+        else
+            for _, p in ipairs(programs_to_turn_off) do
+                program_disable(p)
+            end
+        end
+--        set_global(global_name, value)
     end
 end
 

@@ -16,12 +16,11 @@ local color_high = 1.0
 local gate_sine_speed = 0.2
 local mode_full_bright = 0
 local mode_night = 1
-local global_enable_long_press_seconds = 3
 
 -- Variables
 local ring_enabled = false
 local inner_enabled = false
-local spots_enabled = true
+local spots_enabled = false
 local ring_mode = 0
 local light_mode = mode_night
 
@@ -36,32 +35,42 @@ function setup()
     add_output_alias('kitchen-out-g')
     add_output_alias('kitchen-out-b')
     add_output_alias('kitchen-out-w')
+    add_output_alias('kitchen-spots')
 
     add_event_subscription('button-kitchen-left', EVENT_TYPE_BUTTON_DOWN, 'handle_press')
     add_event_subscription('button-kitchen-left', EVENT_TYPE_BUTTON_LONG_PRESS, 'handle_long_press')
 
-    -- Turn on ring + inner, update variables accordingly
+    -- Turn on the lights, update variables accordingly
     update_rings(2)
 end
 
 function handle_press(_addr, _typ)
+    program_enable('kitchen-light')
     update_rings(1)
 end
 
 function update_rings(change)
-    ring_mode = (ring_mode + change + 4) % 4
+    ring_mode = (ring_mode + change + 5) % 5
     if ring_mode == 0 then
         ring_enabled = false
         inner_enabled = false
+        spots_enabled = true
     elseif ring_mode == 1 then
         ring_enabled = true
         inner_enabled = false
+        spots_enabled = true
     elseif ring_mode == 2 then
         ring_enabled = true
         inner_enabled = true
-    else
+        spots_enabled = true
+    elseif ring_mode == 3 then
         ring_enabled = false
         inner_enabled = true
+        spots_enabled = true
+    else
+        ring_enabled = false
+        inner_enabled = false
+        spots_enabled = false
     end
 end
 

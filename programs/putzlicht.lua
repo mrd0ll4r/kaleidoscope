@@ -16,6 +16,7 @@ function setup()
 end
 
 function handle_long_press(address, _typ, duration)
+    program_enable('putzlicht')
     putzlicht_enabled = not putzlicht_enabled
 end
 

@@ -52,6 +52,7 @@ function setup()
 end
 
 function change_program(_address, _typ)
+    program_enable('spoider')
     program = (program + 1) % num_programs
 end
 

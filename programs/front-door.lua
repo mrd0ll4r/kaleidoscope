@@ -13,13 +13,13 @@ local on_until = NOW
 
 function setup()
     set_priority(5)
-    set_slow_mode(true)
 
     add_output_alias(FRONT_DOOR_LIGHT_ALIAS)
     add_event_subscription('button-front-door-right', EVENT_TYPE_BUTTON_CLICKED, 'handle_click')
 end
 
 function handle_click(_addr, _typ, duration)
+    program_enable('front-door')
     if duration < 1.0 then -- seconds, float
         current_mode = (current_mode + 1) % 2
         if current_mode == MODE_ON then

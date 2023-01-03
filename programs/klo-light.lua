@@ -27,6 +27,7 @@ function setup()
 end
 
 function handle_down(address, _typ)
+    program_enable('klo-light')
     klo_enabled = not klo_enabled
     if not klo_enabled then
         light_mode = mode_night

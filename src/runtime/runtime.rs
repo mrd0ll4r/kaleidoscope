@@ -1,5 +1,5 @@
 use crate::runtime::globals::DeltaTable;
-use crate::runtime::program::Program;
+use crate::runtime::program::{Program, ProgramEnableDelta};
 use crate::runtime::UniverseView;
 use crate::Result;
 use alloy::api::{SetRequest, SubscriptionRequest};
@@ -354,6 +354,44 @@ impl Runtime {
                         p.program.name, err
                     )
                 }
+            }
+        }
+
+        // Collect program enable/disable deltas.
+        // These are collected (and cleared) after events are processed, for all programs,
+        // regardless of whether they are enabled or tick ran. This way, we can have event-handler
+        // programs without a tick function, and programs that actually drive the outputs.
+        let mut deltas = HashMap::new();
+        for p in self.loaded_programs.iter() {
+            match p.program.get_program_enable_deltas() {
+                Ok(d) => deltas.extend(d.into_iter()),
+                Err(err) => {
+                    warn!(
+                        "program {}: unable to get program enable deltas: {:?}",
+                        p.program.name, err
+                    )
+                }
+            }
+        }
+
+        // Enable/disable programs according to the deltas.
+        for (program_name, state_change) in deltas.into_iter() {
+            match self
+                .loaded_programs
+                .iter_mut()
+                .find(|p| p.program.name == program_name)
+            {
+                None => {
+                    warn!(
+                        "got program enable/disable delta for unknown program {}: {:?}",
+                        program_name, state_change
+                    )
+                }
+                Some(p) => match state_change {
+                    ProgramEnableDelta::Enable => p.enabled.set(true),
+                    ProgramEnableDelta::Disable => p.enabled.set(false),
+                    ProgramEnableDelta::Toggle => p.enabled.set(!p.enabled.get()),
+                },
             }
         }
 

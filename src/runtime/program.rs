@@ -11,7 +11,8 @@ use chrono::Timelike;
 use failure::err_msg;
 use itertools::Itertools;
 use noise::{NoiseFn, Perlin};
-use rlua::{Function, Lua, ToLua};
+use rlua::{Context, FromLua, Function, Lua, ToLua, Value};
+use std::collections::hash_map::IntoIter;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Formatter};
 use std::fs;
@@ -29,6 +30,12 @@ const EVENT_TYPE_BUTTON_CLICKED: &str = "button_clicked";
 const EVENT_TYPE_BUTTON_LONG_PRESS: &str = "button_long_press";
 const EVENT_TYPE_ERROR: &str = "error";
 
+/// Program enable/disable constants.
+/// Must be in sync with builtin.lua!
+const PROGRAM_ENABLE_SIGNAL: i64 = 1;
+const PROGRAM_DISABLE_SIGNAL: i64 = 2;
+const PROGRAM_ENABLE_TOGGLE_SIGNAL: i64 = 3;
+
 /// Runtime version.
 const VERSION: u16 = 2;
 
@@ -43,6 +50,57 @@ fn must_have_address(aliases: &HashMap<String, Address>, address: &Address) -> R
     match found {
         true => Ok(()),
         false => Err(err_msg(format!("address not in use: {}", address))),
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub enum ProgramEnableDelta {
+    Enable,
+    Disable,
+    Toggle,
+}
+
+impl<'lua> FromLua<'lua> for ProgramEnableDelta {
+    fn from_lua(lua_value: Value<'lua>, _: Context<'lua>) -> rlua::Result<Self> {
+        match lua_value {
+            Value::Integer(i) => match i {
+                PROGRAM_ENABLE_SIGNAL => Ok(ProgramEnableDelta::Enable),
+                PROGRAM_DISABLE_SIGNAL => Ok(ProgramEnableDelta::Disable),
+                PROGRAM_ENABLE_TOGGLE_SIGNAL => Ok(ProgramEnableDelta::Toggle),
+                _ => Err(rlua::Error::FromLuaConversionError {
+                    from: "unknown",
+                    to: "ProgramEnableDelta",
+                    message: Some("expected integer in [1,3]".to_string()),
+                }),
+            },
+            _ => Err(rlua::Error::FromLuaConversionError {
+                from: "unknown",
+                to: "ProgramEnableDelta",
+                message: Some("expected integer in [1,3]".to_string()),
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgramEnableDeltaTable {
+    v: HashMap<String, ProgramEnableDelta>,
+}
+
+impl IntoIterator for ProgramEnableDeltaTable {
+    type Item = (String, ProgramEnableDelta);
+    type IntoIter = IntoIter<String, ProgramEnableDelta>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.v.into_iter()
+    }
+}
+
+impl<'lua> FromLua<'lua> for ProgramEnableDeltaTable {
+    fn from_lua(value: Value<'lua>, lua: Context<'lua>) -> rlua::Result<Self> {
+        let v: HashMap<String, ProgramEnableDelta> = HashMap::from_lua(value, lua)?;
+        Ok(ProgramEnableDeltaTable { v })
     }
 }
 
@@ -165,6 +223,17 @@ impl Program {
     pub(crate) fn get_global_deltas(&self) -> Result<DeltaTable> {
         self.lua.context(|ctx| -> Result<DeltaTable> {
             let deltas = ctx.globals().get("_global_deltas")?;
+            Ok(deltas)
+        })
+    }
+
+    pub(crate) fn get_program_enable_deltas(&self) -> Result<ProgramEnableDeltaTable> {
+        self.lua.context(|ctx| -> Result<ProgramEnableDeltaTable> {
+            let deltas = ctx
+                .globals()
+                .get::<_, Function>("_get_program_enable_deltas")?
+                .call(())?;
+
             Ok(deltas)
         })
     }
