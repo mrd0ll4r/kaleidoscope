@@ -1,4 +1,5 @@
 use crate::runtime::globals::DeltaTable;
+use crate::runtime::parameters::{DiscreteParameterValue, ParameterDelta, ParameterTable};
 use crate::runtime::UniverseView;
 use crate::Result;
 use alloy::config::{InputValue, UniverseConfig};
@@ -35,6 +36,11 @@ const EVENT_TYPE_ERROR: &str = "error";
 const PROGRAM_ENABLE_SIGNAL: i64 = 1;
 const PROGRAM_DISABLE_SIGNAL: i64 = 2;
 const PROGRAM_ENABLE_TOGGLE_SIGNAL: i64 = 3;
+
+/// Parameter type constants.
+/// Must be in sync with builtin.lua!
+const PARAMETER_TYPE_DISCRETE: &str = "discrete";
+const PARAMETER_TYPE_CONTINUOUS: &str = "continuous";
 
 /// Runtime version.
 const VERSION: u16 = 2;
@@ -138,6 +144,7 @@ impl Debug for Program {
 impl Program {
     pub async fn new<P: AsRef<Path>>(
         universe_config: &UniverseConfig,
+        parameters: Arc<std::sync::Mutex<ParameterTable>>,
         source_file: P,
     ) -> Result<Program> {
         let lua = Lua::new();
@@ -163,7 +170,13 @@ impl Program {
 
             // Inject a bunch of constants after builtins were loaded, but before the program source
             // is loaded.
-            Self::inject_pre_load_constants(&ctx, program_epoch, universe_config)?;
+            Self::inject_pre_load_constants(
+                &ctx,
+                program_epoch,
+                name.clone(),
+                parameters.clone(),
+                universe_config,
+            )?;
 
             // Load program source.
             ctx.load(&program_source).exec()?;
@@ -175,8 +188,14 @@ impl Program {
             Ok(())
         })?;
 
-        let setup_values =
-            Self::setup(&lua, universe_config, program_epoch.elapsed().as_secs_f64()).await?;
+        let setup_values = Self::setup(
+            &lua,
+            name.clone(),
+            parameters.clone(),
+            universe_config,
+            program_epoch.elapsed().as_secs_f64(),
+        )
+        .await?;
         debug!("set up program {}: {:?}", name, setup_values);
 
         // set up event stuff
@@ -247,6 +266,40 @@ impl Program {
             let handler: Function = globals.get("_update_globals")?;
 
             handler.call(delta_table.to_lua(ctx))?;
+
+            Ok(())
+        })?;
+
+        Ok(())
+    }
+
+    pub(crate) fn handle_incoming_parameter_deltas(
+        &self,
+        deltas: HashMap<String, ParameterDelta>,
+    ) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+
+        // Encode deltas as one long string, because performance.
+        let deltas = deltas
+            .into_iter()
+            .map(|(param_name, delta)| match delta {
+                ParameterDelta::Continuous(d) => {
+                    format!("{} {} {}", param_name, "c", d)
+                }
+                ParameterDelta::Discrete(d) => {
+                    format!("{} {} {}", param_name, "d", d)
+                }
+            })
+            .join(";");
+
+        // Call distributor
+        self.lua.context(|ctx| -> Result<()> {
+            let globals = ctx.globals();
+            let handler: Function = globals.get("_handle_parameter_events")?;
+
+            handler.call(deltas)?;
 
             Ok(())
         })?;
@@ -430,6 +483,8 @@ impl Program {
     fn inject_pre_load_constants(
         ctx: &rlua::Context,
         program_epoch: Instant,
+        program_name: String,
+        parameters: Arc<std::sync::Mutex<ParameterTable>>,
         universe: &UniverseConfig,
     ) -> Result<()> {
         let globals = ctx.globals();
@@ -437,6 +492,7 @@ impl Program {
         // Inject constants.
         globals.set("START", program_epoch.elapsed().as_secs_f64())?;
         globals.set("NOW", program_epoch.elapsed().as_secs_f64())?;
+        globals.set("PROGRAM_NAME", program_name.clone())?;
         globals.set("KALEIDOSCOPE_VERSION", VERSION)?;
 
         // Inject translations for aliases and groups.
@@ -492,16 +548,148 @@ impl Program {
             })?,
         )?;
 
+        // Parameter functions
+        {
+            let parameters = parameters.clone();
+            let program_name = program_name.clone();
+            globals.set(
+                "get_foreign_discrete_parameter_value",
+                ctx.create_function(
+                    move |_, (p_program_name, parameter_name): (String, String)| {
+                        let parameters = parameters.lock().unwrap();
+                        parameters
+                            .get_discrete_parameter_value(&p_program_name, &parameter_name)
+                            .map_err(|e| {
+                                error!(
+                                    "program {} attempted to access invalid parameter: {:?}",
+                                    program_name, e
+                                );
+                                rlua::Error::external(e)
+                            })
+                    },
+                )?,
+            )?;
+        }
+        {
+            let parameters = parameters.clone();
+            let program_name = program_name.clone();
+            globals.set(
+                "get_foreign_continuous_parameter_value",
+                ctx.create_function(
+                    move |_, (p_program_name, parameter_name): (String, String)| {
+                        let parameters = parameters.lock().unwrap();
+                        parameters
+                            .get_continuous_parameter_value(&p_program_name, &parameter_name)
+                            .map_err(|e| {
+                                error!(
+                                    "program {} attempted to access invalid parameter: {:?}",
+                                    program_name, e
+                                );
+                                rlua::Error::external(e)
+                            })
+                    },
+                )?,
+            )?;
+        }
+        {
+            let parameters = parameters.clone();
+            let program_name = program_name.clone();
+            globals.set(
+                "set_foreign_discrete_parameter_value",
+                ctx.create_function(
+                    move |_,
+                          (p_program_name, parameter_name, parameter_value): (
+                        String,
+                        String,
+                        i32,
+                    )| {
+                        let mut parameters = parameters.lock().unwrap();
+                        parameters
+                            .set_discrete_parameter(
+                                &p_program_name,
+                                &parameter_name,
+                                parameter_value,
+                            )
+                            .map_err(|e| {
+                                error!(
+                                    "program {} attempted to set invalid parameter: {:?}",
+                                    program_name, e
+                                );
+                                rlua::Error::external(e)
+                            })
+                    },
+                )?,
+            )?;
+        }
+        {
+            let parameters = parameters.clone();
+            let program_name = program_name.clone();
+            globals.set(
+                "set_foreign_continuous_parameter_value",
+                ctx.create_function(
+                    move |_,
+                          (p_program_name, parameter_name, parameter_value): (
+                        String,
+                        String,
+                        f64,
+                    )| {
+                        let mut parameters = parameters.lock().unwrap();
+                        parameters
+                            .set_continuous_parameter(
+                                &p_program_name,
+                                &parameter_name,
+                                parameter_value,
+                            )
+                            .map_err(|e| {
+                                error!(
+                                    "program {} attempted to set invalid parameter: {:?}",
+                                    program_name, e
+                                );
+                                rlua::Error::external(e)
+                            })
+                    },
+                )?,
+            )?;
+        }
+        {
+            let parameters = parameters.clone();
+            let program_name = program_name.clone();
+            globals.set(
+                "increment_foreign_discrete_parameter_value",
+                ctx.create_function(
+                    move |_, (p_program_name, parameter_name, delta): (String, String, i32)| {
+                        let mut parameters = parameters.lock().unwrap();
+                        parameters
+                            .increment_discrete_parameter(&p_program_name, &parameter_name, delta)
+                            .map_err(|e| {
+                                error!(
+                                    "program {} attempted to set invalid parameter: {:?}",
+                                    program_name, e
+                                );
+                                rlua::Error::external(e)
+                            })
+                    },
+                )?,
+            )?;
+        }
+
         Ok(())
     }
 
-    async fn setup(lua: &Lua, universe: &UniverseConfig, now: f64) -> Result<SetupValues> {
+    async fn setup(
+        lua: &Lua,
+        program_name: String,
+        parameters: Arc<std::sync::Mutex<ParameterTable>>,
+        universe: &UniverseConfig,
+        now: f64,
+    ) -> Result<SetupValues> {
         let mut priority: u8 = 0; // TODO use option
         let mut slow_mode = false;
         let mut inputs: HashSet<Address> = HashSet::new();
         let mut outputs: HashSet<Address> = HashSet::new();
         let mut event_targets: HashMap<Address, Vec<(EventFilterEntry, String, String)>> =
             HashMap::new();
+        let mut parameter_handlers: HashMap<String, String> = HashMap::new();
         let output_aliases: HashMap<_, _> = universe
             .devices
             .iter()
@@ -542,6 +730,52 @@ impl Program {
                 // These are only valid inside of the `scope`, in which we will also call `setup()`.
                 // This is good, because these are setup-related and we don't want users to call them
                 // from `tick()`.
+
+                let declare_parameter_generic = scope
+                    .create_function_mut(|_,
+                                          (type_name, param_name, description, event_handler, discrete_values, discrete_initial, continuous_lower, continuous_upper, continuous_initial):
+                                          (String, String, String, String, Vec<DiscreteParameterValue>, i32, f64, f64, f64)| {
+
+                        // Check if handler function exists.
+                        ctx.globals().get::<_, Function>(event_handler.clone())?;
+
+                        // Try to register a new parameter.
+                        let mut parameters = parameters.lock().unwrap();
+                        match type_name.as_str() {
+                            PARAMETER_TYPE_DISCRETE => {
+                                debug!("attempting to create discrete parameter {} for program {} with values {:?} and initial {}",param_name,program_name,discrete_values,discrete_initial);
+                                if let Err(e) = parameters.declare_discrete_parameter(program_name.clone(), param_name.clone(),
+                                                                                      description,discrete_values, discrete_initial) {
+                                    error!("unable to create discrete parameter {} for program {}: {:?}",param_name,program_name,e);
+                                    return Err(rlua::Error::external(format_err!(
+                                        "unable to create parameter: {:?}",e
+                                    )));
+                                }
+                            }
+                            PARAMETER_TYPE_CONTINUOUS => {
+                                debug!("attempting to create continuous parameter {} for program {} with limits [{}, {}] and initial {}",
+                                    param_name,program_name,continuous_lower,continuous_upper,continuous_initial);
+                                if let Err(e) = parameters.declare_continuous_parameter(program_name.clone(), param_name.clone(),
+                                                                                        description,continuous_lower, continuous_upper, continuous_initial) {
+                                    error!("unable to create continuous parameter {} for program {}: {:?}",param_name,program_name,e);
+                                    return Err(rlua::Error::external(format_err!(
+                                        "unable to create parameter: {:?}",e
+                                    )));
+                                }
+                            }
+                            _ => {
+                                return Err(rlua::Error::external(err_msg(format!(
+                                    "invalid parameter type: {}",
+                                    type_name
+                                ))));
+                            }
+                        };
+
+                        parameter_handlers.insert(param_name, event_handler);
+
+                        Ok(())
+                    })?;
+                globals.set("_declare_parameter_generic", declare_parameter_generic)?;
 
                 let set_priority = scope.create_function_mut(|_, prio| {
                     if prio > 20 {
@@ -677,6 +911,9 @@ impl Program {
 
             // Clear values again (so that after this only registered-for inputs are available)
             globals.set("input_values_by_address", rlua::Nil)?;
+
+            // Set up parameter handlers
+            globals.set("_parameter_event_handlers",parameter_handlers)?;
 
             // Set up event routing
             globals.set(

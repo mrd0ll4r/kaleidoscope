@@ -1,4 +1,5 @@
 use crate::runtime::globals::DeltaTable;
+use crate::runtime::parameters::ParameterTable;
 use crate::runtime::program::{Program, ProgramEnableDelta};
 use crate::runtime::UniverseView;
 use crate::Result;
@@ -26,6 +27,10 @@ pub(crate) struct Runtime {
     _universe_view: Arc<Mutex<UniverseView>>,
     set_tx: mpsc::Sender<Vec<SetRequest>>,
     events_processed: Arc<Mutex<u64>>,
+
+    // This uses a std::sync::Mutex because we hand copies of this to Lua, which can't do
+    // Rust async things.
+    program_parameters: Arc<std::sync::Mutex<ParameterTable>>,
 
     // ordered by priority descending
     loaded_programs: Vec<Rc<WrappedProgram>>,
@@ -205,8 +210,11 @@ impl Runtime {
         let events_counter = Arc::new(Mutex::new(0 as u64));
         let task_events_counter = events_counter.clone();
 
+        let program_parameters = Arc::new(std::sync::Mutex::new(ParameterTable::new()));
+
         // Load and setup programs
-        let programs = Self::load_programs("programs/", &config).await?;
+        let programs =
+            Self::load_programs("programs/", &config, program_parameters.clone()).await?;
 
         // TODO check if two programs with the same priority output to the same addresses?
 
@@ -282,6 +290,7 @@ impl Runtime {
             events_processed: events_counter,
             tick_values,
             event_buffer,
+            program_parameters,
         })
     }
 
@@ -392,6 +401,24 @@ impl Runtime {
                     ProgramEnableDelta::Disable => p.enabled.set(false),
                     ProgramEnableDelta::Toggle => p.enabled.set(!p.enabled.get()),
                 },
+            }
+        }
+
+        // Handle parameter deltas
+        let mut deltas = {
+            let params = self.program_parameters.clone();
+            tokio::task::spawn_blocking(move || params.lock().unwrap().get_deltas())
+                .await
+                .context("unable to lock parameter table")?
+        };
+        for p in self.loaded_programs.iter() {
+            if let Some(deltas) = deltas.remove(&p.program.name) {
+                if let Err(e) = p.program.handle_incoming_parameter_deltas(deltas) {
+                    warn!(
+                        "program {}: unable to handle parameter updates: {:?}",
+                        p.program.name, e
+                    )
+                }
             }
         }
 
@@ -526,6 +553,7 @@ impl Runtime {
     async fn load_programs<P: AsRef<Path>>(
         dir: P,
         universe_config: &UniverseConfig,
+        parameters: Arc<std::sync::Mutex<ParameterTable>>,
     ) -> Result<Vec<Program>> {
         let mut programs = Vec::new();
         let files = fs::read_dir(dir)?;
@@ -536,7 +564,7 @@ impl Runtime {
 
         for file in files {
             info!("attempting to load program at {:?}...", file.path());
-            let p = Program::new(universe_config, file.path())
+            let p = Program::new(universe_config, parameters.clone(), file.path())
                 .await
                 .context(format!("unable to load program at {:?}", file.path()))?;
             programs.push(p);

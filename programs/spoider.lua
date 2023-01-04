@@ -21,16 +21,15 @@ local color_low = 0.3
 local color_high = 0.6
 local gate_sine_speed = 0.2
 
--- Program indices
-local num_programs = 5
-local program_off = 0
-local program_night_warm = 1
-local program_party = 2
-local program_bright = 3
-local program_full_bright = 4
+local MODE_PARAMETER_NAME = "mode"
+local MODE_OFF = 0
+local MODE_NIGHT_WARM = 1
+local MODE_BRIGHT = 2
+local MODE_FULL_BRIGHT = 3
+local MODE_PARTY = 4
 
 -- Variables variables
-local program = program_night_warm
+local current_mode = MODE_NIGHT_WARM
 
 function setup()
     set_priority(3)
@@ -47,17 +46,17 @@ function setup()
     add_output_alias('spoider-inner-down-b')
     add_output_alias('spoider-inner-down-w')
 
-    add_event_subscription('button-glassdoor-left', EVENT_TYPE_BUTTON_DOWN, 'change_program')
-    add_event_subscription('button-glassdoor-left', EVENT_TYPE_BUTTON_LONG_PRESS, 'handle_long_press')
+    declare_discrete_parameter(MODE_PARAMETER_NAME, "different modes",
+        {build_discrete_parameter_value("Off", MODE_OFF),
+         build_discrete_parameter_value("Night warm", MODE_NIGHT_WARM),
+         build_discrete_parameter_value("Bright", MODE_BRIGHT),
+         build_discrete_parameter_value("Full Bright", MODE_FULL_BRIGHT),
+         build_discrete_parameter_value("Full Bright", MODE_PARTY)
+        }, current_mode, "handle_mode_change")
 end
 
-function change_program(_address, _typ)
-    program_enable('spoider')
-    program = (program + 1) % num_programs
-end
-
-function handle_long_press(_address, _typ, duration)
-    program = program_bright
+function handle_mode_change(to)
+    current_mode = to
 end
 
 function white_sine(index, now)
@@ -367,32 +366,15 @@ function run_program_party(now)
 end
 
 function tick(now)
-    local global_enabled = get_global("global_enable")
-
-    set_alias('spoider-outer-r', LOW)
-    set_alias('spoider-outer-g', LOW)
-    set_alias('spoider-outer-b', LOW)
-    set_alias('spoider-outer-w', LOW)
-    set_alias('spoider-inner-up-r', LOW)
-    set_alias('spoider-inner-up-g', LOW)
-    set_alias('spoider-inner-up-b', LOW)
-    set_alias('spoider-inner-up-w', LOW)
-    set_alias('spoider-inner-down-r', LOW)
-    set_alias('spoider-inner-down-g', LOW)
-    set_alias('spoider-inner-down-b', LOW)
-    set_alias('spoider-inner-down-w', LOW)
-
-    if global_enabled then
-        if program == program_off then
-            -- off
-        elseif program == program_full_bright then
-            run_program_full_bright()
-        elseif program == program_bright then
-            run_program_bright()
-        elseif program == program_night_warm then
-            run_program_night_warm(now)
-        elseif program == program_party then
-            run_program_party(now)
-        end
+    if current_mode == MODE_OFF then
+        -- off
+    elseif current_mode == MODE_FULL_BRIGHT then
+        run_program_full_bright()
+    elseif current_mode == MODE_BRIGHT then
+        run_program_bright()
+    elseif current_mode == MODE_NIGHT_WARM then
+        run_program_night_warm(now)
+    elseif current_mode == MODE_PARTY then
+        run_program_party(now)
     end
 end

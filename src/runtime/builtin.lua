@@ -1,5 +1,7 @@
 LOW = 0
 HIGH = 65535
+-- The name of the program file being executed, without the .lua extension.
+PROGRAM_NAME = 'some-name'
 
 -- This is set for each execution and represents a point in time when the program was started, as seconds from some point in time.
 START = 123.45
@@ -15,6 +17,7 @@ function now()
     return NOW
 end
 
+-- ================ SETUP ================
 -- These are provided by the runtime during setup
 function set_priority(p) end
 function set_slow_mode(slow_mode) end
@@ -22,20 +25,97 @@ function add_input_alias(alias) end
 function add_output_alias(alias) end
 function add_output_group(group) end
 function add_event_subscription(alias, event_type, target_function_name) end
--- And these maybe during event handling too? (not yet)
+
+-- Functions to control whether tick() should run.
+-- For the time being, program_enable and program_disable achieve the same.
 function enable_tick() end
 function disable_tick() end
 
--- Provided by the runtime:
+-- Functions to declare parameters
+function build_discrete_parameter_value(label, value)
+    local tmp={}
+    tmp['_label'] = label
+    tmp['_value'] = value
+    return tmp
+end
+
+-- Parameter type constants, as used in program.rs
+PARAMETER_TYPE_DISCRETE = "discrete"
+PARAMETER_TYPE_CONTINUOUS = "continuous"
+-- The runtime provides a function with this signature during setup:
+-- function _declare_parameter_generic(param_type, param_name, description, event_handler, discrete_values, discrete_initial, continuous_lower, continuous_upper, continuous_initial) end
+function declare_discrete_parameter(name, description, values, initial_value, event_handler)
+    -- TODO typecheck parameters
+    _declare_parameter_generic(PARAMETER_TYPE_DISCRETE, name, description, event_handler, values, initial_value, 0,0,0)
+end
+function declare_continuous_parameter(name, description, lower, upper, initial_value, event_handler)
+    -- TODO typecheck parameters
+    _declare_parameter_generic(PARAMETER_TYPE_CONTINUOUS, name, description, event_handler, {}, 0, lower, upper, initial_value)
+end
+
+-- ================ RUNTIME ================
+-- Access to parameters.
+function get_discrete_parameter_value(name)
+    get_foreign_discrete_parameter_value(PROGRAM_NAME, name)
+end
+function get_continuous_parameter_value(name)
+    get_foreign_continuous_parameter_value(PROGRAM_NAME, name)
+end
+function set_discrete_parameter_value(name, value)
+    set_foreign_discrete_parameter_value(PROGRAM_NAME, name, value)
+end
+function set_continuous_parameter_value(name, value)
+    set_foreign_continuous_parameter_value(PROGRAM_NAME, name, value)
+end
+function increment_discrete_parameter_value(name, delta)
+    increment_foreign_discrete_parameter(PROGRAM_NAME, name, delta)
+end
+
+-- Access to parameters of other programs.
+-- These call into Rust and are not cheap.
+-- It should be preferred to use event handlers to receive updates about parameters.
+function get_foreign_discrete_parameter_value(program_name, parameter_name) end
+function get_foreign_continuous_parameter_value(program_name, parameter_name) end
+function set_foreign_discrete_parameter_value(program_name, parameter_name, value) end
+function set_foreign_continuous_parameter_value(program_name, parameter_name, value) end
+function increment_foreign_discrete_parameter_value(program_name, parameter_name, delta) end
+
+_parameter_event_handlers = {}
+-- This is called by the runtime to handle updates to parameters.
+-- Parameter updates are passed into Lua as one string. (Extensive research has shown this to be most performant...)
+-- Within that string, single updates are separated by a ";".
+-- Within one update, fields are separated by a space.
+function _handle_parameter_events(events)
+    for event in string.gmatch(events, "[^;]*") do
+        --print(event)
+        local split = {}
+        for i in event:gmatch("%S*") do
+            split[#split + 1] = i
+        end
+        local param_name = split[1]
+        local typ = split[2]
+        local val = 0
+        if typ == "d" then
+            -- TODO figure out integers
+            val = tonumber(split[3])
+        elseif typ == "c" then
+            val = tonumber(split[3])
+        end
+
+        local handler = _parameter_event_handlers[param_name]
+        if handler == nil then
+            return
+        end
+        _G[handler](val)
+    end
+end
+
 -- Perlin noise functions, returning values in [-1,1]
 function noise2d(x, y) return 0.0 end
-
 function noise3d(x, y, z) return 0.0 end
-
 function noise3d(x, y, z, t) return 0.0 end
 
--- Provided by the runtime:
--- Functions to access global, shared values.
+-- Functions to access and modify global, shared values.
 _globals = {}
 function get_global(key)
     return _globals[key]
@@ -71,11 +151,13 @@ function _update_globals(new_values)
     end
 end
 
-
+-- Program enable/disable constants.
+-- Must be in sync with program.rs
 PROGRAM_ENABLE_SIGNAL = 1
 PROGRAM_DISABLE_SIGNAL = 2
 PROGRAM_ENABLE_TOGGLE_SIGNAL = 3
 
+-- Functions to enable/disable programs by name.
 _program_enable_deltas = {}
 function program_enable(program_name)
     assert(type(program_name) == "string", "program names must be strings")

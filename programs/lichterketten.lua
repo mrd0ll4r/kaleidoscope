@@ -9,9 +9,12 @@ local KETTE_2_OUTLET = 'outlet-2-s2'
 local KETTE_3_OUTLET = 'outlet-4-s1'
 local KETTE_4_OUTLET = 'outlet-8-s2'
 
+local MODE_BRIGHTNESS_NAME = "brightness"
+local MODE_BRIGHTNESS_NIGHT = 0
+local MODE_BRIGHTNESS_FULL_BRIGHT = 1
+
 -- Variables
-local ketten_enabled = true
-local light_mode = mode_full_bright -- this saves relay cycles
+local current_brightness_mode = MODE_BRIGHTNESS_FULL_BRIGHT
 
 function setup()
     set_priority(3)
@@ -20,21 +23,15 @@ function setup()
     add_output_alias(KETTE_3_OUTLET)
     add_output_alias(KETTE_4_OUTLET)
 
-    add_event_subscription('button-glassdoor-right', EVENT_TYPE_BUTTON_DOWN, 'handle_down')
-    add_event_subscription('button-glassdoor-right', EVENT_TYPE_BUTTON_LONG_PRESS, 'handle_long_press')
+    -- Declare parameters
+    declare_discrete_parameter(MODE_BRIGHTNESS_NAME, "day/night brightness mode",
+        {build_discrete_parameter_value("Night", MODE_BRIGHTNESS_NIGHT),
+         build_discrete_parameter_value("Full Bright", MODE_BRIGHTNESS_FULL_BRIGHT)
+        }, current_brightness_mode, "handle_brightness_mode_change")
 end
 
-function handle_down(address, _typ)
-    program_enable('lichterketten')
-    ketten_enabled = not ketten_enabled
-    if not ketten_enabled then
-        light_mode = mode_night
-    end
-end
-
-function handle_long_press(address, _typ, duration)
-    light_mode = mode_full_bright
-    ketten_enabled = true
+function handle_brightness_mode_change(to)
+    current_brightness_mode=to
 end
 
 function tick(now)
@@ -43,30 +40,23 @@ function tick(now)
     local kette3_on = (math.floor(now/30) % 2 == 0)
     local kette4_on = noise2d(4, now*noise_speed) > 0
 
-    set_alias(KETTE_1_OUTLET,LOW)
-    set_alias(KETTE_2_OUTLET,LOW)
-    set_alias(KETTE_3_OUTLET,LOW)
-    set_alias(KETTE_4_OUTLET,LOW)
-
-    if ketten_enabled and get_global("global_enable") then
-        if light_mode == mode_night then
-            if kette1_on then
-                set_alias(KETTE_1_OUTLET, HIGH)
-            end
-            if kette2_on then
-                set_alias(KETTE_2_OUTLET, HIGH)
-            end
-            if kette3_on then
-                set_alias(KETTE_3_OUTLET, HIGH)
-            end
-            if kette4_on then
-                set_alias(KETTE_4_OUTLET, HIGH)
-            end
-         else
-            set_alias(KETTE_1_OUTLET,HIGH)
-            set_alias(KETTE_2_OUTLET,HIGH)
-            set_alias(KETTE_3_OUTLET,HIGH)
-            set_alias(KETTE_4_OUTLET,HIGH)
+    if current_brightness_mode == MODE_BRIGHTNESS_NIGHT then
+        if kette1_on then
+            set_alias(KETTE_1_OUTLET, HIGH)
         end
+        if kette2_on then
+            set_alias(KETTE_2_OUTLET, HIGH)
+        end
+        if kette3_on then
+            set_alias(KETTE_3_OUTLET, HIGH)
+        end
+        if kette4_on then
+            set_alias(KETTE_4_OUTLET, HIGH)
+        end
+     else
+        set_alias(KETTE_1_OUTLET, HIGH)
+        set_alias(KETTE_2_OUTLET, HIGH)
+        set_alias(KETTE_3_OUTLET, HIGH)
+        set_alias(KETTE_4_OUTLET, HIGH)
     end
 end

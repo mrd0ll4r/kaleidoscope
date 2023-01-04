@@ -7,6 +7,7 @@ use rlua::{Context, ToLua, Value};
 use std::collections::HashMap;
 
 mod globals;
+mod parameters;
 mod program;
 pub mod runtime;
 
