@@ -1,25 +1,25 @@
 [package]
 name = "kaleidoscope"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Leo Balduf <leobalduf@gmail.com>"]
 edition = "2021"
 
 [dependencies]
 #alloy = {git = "https://github.com/mrd0ll4r/alloy"}
 alloy = { path = "../alloy" }
-failure = { version = "0.1", features = ["std", "backtrace"] }
+anyhow = {version="1.0.75", features = ["backtrace"]}
 log = { version = "0.4", features = ["std", "serde"] }
-flexi_logger = { version = "0.24" }
+flexi_logger = { version = "0.25.6" }
 #serde = {version="1.0.104",features=["derive"]}
 #serde_json = "1.0.46"
-itertools = "0.10"
+itertools = "0.11.0"
 statistical = "1.0.0"
 
 # Tokio, Lua, Runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time"] }
 tokio-stream = "0.1"
 futures = "0.3"
-interpolation = "0.2"
+interpolation = "0.3.0"
 noise = "0.8"
 rlua = "0.19"
 chrono = "0.4"

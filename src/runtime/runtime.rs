@@ -10,8 +10,9 @@ use alloy::event::{
 };
 use alloy::tcp::PushedMessage;
 use alloy::{Address, OutputValue};
-use failure::{err_msg, ResultExt};
+use anyhow::{anyhow, bail, Context};
 use itertools::Itertools;
+use log::{debug, error, info, warn};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -187,7 +188,7 @@ impl Runtime {
             let msg = push_receiver
                 .recv()
                 .await
-                .ok_or(err_msg("did not receive universe config from server"))?;
+                .ok_or(anyhow!("did not receive universe config from server"))?;
             match msg {
                 PushedMessage::Event(_) => {
                     bail!("did not receive universe config as first message from server")

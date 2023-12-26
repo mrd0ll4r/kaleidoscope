@@ -1,3 +1,4 @@
+use anyhow::{anyhow, bail};
 use rlua::{Context, FromLua, ToLua, Value};
 use std::collections::HashMap;
 use std::mem;
@@ -51,7 +52,7 @@ impl ParameterTable {
         self.program_parameters
             .get_mut(program_name)
             .and_then(|params| params.parameters.get_mut(parameter_name))
-            .ok_or(format_err!(
+            .ok_or(anyhow!(
                 "unknown parameter {} for program {}",
                 parameter_name,
                 program_name
@@ -66,7 +67,7 @@ impl ParameterTable {
         self.program_parameters
             .get(program_name)
             .and_then(|params| params.parameters.get(parameter_name))
-            .ok_or(format_err!(
+            .ok_or(anyhow!(
                 "unknown parameter {} for program {}",
                 parameter_name,
                 program_name

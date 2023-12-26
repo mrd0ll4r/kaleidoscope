@@ -1,6 +1,12 @@
 use crate::Result;
+use lazy_static::lazy_static;
+use log::warn;
 use prometheus::exponential_buckets;
-use prometheus::{Gauge, GaugeVec, Histogram, IntCounter, IntGauge, IntGaugeVec};
+use prometheus::{
+    register_gauge, register_gauge_vec, register_histogram, register_int_counter,
+    register_int_gauge, register_int_gauge_vec, Gauge, GaugeVec, Histogram, IntCounter, IntGauge,
+    IntGaugeVec,
+};
 use std::net::SocketAddr;
 use std::thread;
 use std::time::Duration;

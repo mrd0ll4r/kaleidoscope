@@ -1,19 +1,10 @@
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate prometheus;
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate failure;
-
 use std::thread;
 use std::time::{Duration, Instant};
 
 use alloy::tcp::AsyncClient;
-use failure::{Error, ResultExt};
+use anyhow::Context;
 use flexi_logger::{DeferredNow, Logger, LoggerHandle, TS_DASHES_BLANK_COLONS_DOT_BLANK};
-use log::Record;
+use log::{debug, info, Record};
 
 use crate::runtime::runtime::Runtime;
 
@@ -22,7 +13,7 @@ mod runtime;
 
 const REMOTE: &str = "127.0.0.1:3030";
 
-pub(crate) type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = anyhow::Result<T>;
 
 fn log_format(
     w: &mut dyn std::io::Write,

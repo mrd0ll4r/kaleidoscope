@@ -2,7 +2,7 @@ use crate::Result;
 use alloy::config::{InputValue, UniverseConfig};
 use alloy::event::{AddressedEvent, EventKind};
 use alloy::Address;
-use failure::err_msg;
+use anyhow::anyhow;
 use rlua::{Context, ToLua, Value};
 use std::collections::HashMap;
 
@@ -42,7 +42,7 @@ impl UniverseView {
         let v = self
             .v
             .get_mut(&event.address)
-            .ok_or(err_msg("missing address"))?;
+            .ok_or(anyhow!("missing address"))?;
 
         match event.event.inner.clone() {
             Ok(e) => {

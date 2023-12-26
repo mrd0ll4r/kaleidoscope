@@ -8,9 +8,11 @@ use alloy::event::{
     EventFilterStrategy, EventKind,
 };
 use alloy::{Address, OutputValue};
+use anyhow::{anyhow, ensure};
 use chrono::Timelike;
-use failure::err_msg;
 use itertools::Itertools;
+use lazy_static::lazy_static;
+use log::{debug, error};
 use noise::{NoiseFn, Perlin};
 use rlua::{Context, FromLua, Function, Lua, ToLua, Value};
 use std::collections::hash_map::IntoIter;
@@ -55,7 +57,7 @@ fn must_have_address(aliases: &HashMap<String, Address>, address: &Address) -> R
     let found = aliases.values().find(|v| **v == *address).is_some();
     match found {
         true => Ok(()),
-        false => Err(err_msg(format!("address not in use: {}", address))),
+        false => Err(anyhow!("address not in use: {}", address)),
     }
 }
 
@@ -151,9 +153,9 @@ impl Program {
         let name = source_file
             .as_ref()
             .file_stem()
-            .ok_or_else(|| err_msg("no file name?"))?
+            .ok_or_else(|| anyhow!("no file name?"))?
             .to_str()
-            .ok_or_else(|| err_msg("invalid path?"))?
+            .ok_or_else(|| anyhow!("invalid path?"))?
             .to_string();
         debug!("loading program {}...", name);
         let program_source = fs::read_to_string(source_file)?;
@@ -747,7 +749,7 @@ impl Program {
                                 if let Err(e) = parameters.declare_discrete_parameter(program_name.clone(), param_name.clone(),
                                                                                       description,discrete_values, discrete_initial) {
                                     error!("unable to create discrete parameter {} for program {}: {:?}",param_name,program_name,e);
-                                    return Err(rlua::Error::external(format_err!(
+                                    return Err(rlua::Error::external(anyhow!(
                                         "unable to create parameter: {:?}",e
                                     )));
                                 }
@@ -758,16 +760,16 @@ impl Program {
                                 if let Err(e) = parameters.declare_continuous_parameter(program_name.clone(), param_name.clone(),
                                                                                         description,continuous_lower, continuous_upper, continuous_initial) {
                                     error!("unable to create continuous parameter {} for program {}: {:?}",param_name,program_name,e);
-                                    return Err(rlua::Error::external(format_err!(
+                                    return Err(rlua::Error::external(anyhow!(
                                         "unable to create parameter: {:?}",e
                                     )));
                                 }
                             }
                             _ => {
-                                return Err(rlua::Error::external(err_msg(format!(
+                                return Err(rlua::Error::external(anyhow!(
                                     "invalid parameter type: {}",
                                     type_name
-                                ))));
+                                )));
                             }
                         };
 
@@ -884,10 +886,10 @@ impl Program {
                                     filter: ButtonEventFilter::LongPress,
                                 },
                                 _ => {
-                                    return Err(rlua::Error::external(err_msg(format!(
+                                    return Err(rlua::Error::external(anyhow!(
                                         "invalid event type: {}",
                                         type_name
-                                    ))));
+                                    )));
                                 }
                             },
                         };
