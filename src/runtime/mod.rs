@@ -1,11 +1,13 @@
 use crate::Result;
+use alloy::api::TimestampedInputValue;
 use alloy::config::{InputValue, UniverseConfig};
 use alloy::event::{AddressedEvent, EventKind};
 use alloy::Address;
-use anyhow::anyhow;
+use anyhow::{anyhow, ensure};
 use rlua::{Context, ToLua, Value};
 use std::collections::HashMap;
 
+mod event;
 mod globals;
 mod parameters;
 mod program;
@@ -36,6 +38,21 @@ impl UniverseView {
             )
             .collect();
         Self::new_with_addresses(&addresses)
+    }
+
+    fn apply_initial_values(
+        &mut self,
+        values: HashMap<Address, Option<TimestampedInputValue>>,
+    ) -> Result<()> {
+        for (addr, value) in values.into_iter() {
+            if let Some(value) = value {
+                ensure!(self.v.contains_key(&addr), "missing address {}", addr);
+
+                self.v.insert(addr, Some(value.value));
+            }
+        }
+
+        Ok(())
     }
 
     fn apply_event(&mut self, event: &AddressedEvent) -> Result<()> {

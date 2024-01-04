@@ -3,16 +3,16 @@ use crate::runtime::parameters::ParameterTable;
 use crate::runtime::program::{Program, ProgramEnableDelta};
 use crate::runtime::UniverseView;
 use crate::Result;
-use alloy::api::{SetRequest, SubscriptionRequest};
+use alloy::amqp::ExchangeSubmarineInput;
+use alloy::api::{SetRequest, SetRequestTarget, TimestampedInputValue};
 use alloy::config::UniverseConfig;
-use alloy::event::{
-    AddressedEvent, EventFilter, EventFilterEntry, EventFilterKind, EventFilterStrategy,
-};
-use alloy::tcp::PushedMessage;
+use alloy::event::AddressedEvent;
 use alloy::{Address, OutputValue};
-use anyhow::{anyhow, bail, Context};
+use anyhow::Context;
+use futures::StreamExt;
 use itertools::Itertools;
 use log::{debug, error, info, warn};
+use reqwest::Url;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
@@ -54,7 +54,7 @@ impl Runtime {
             .filter(|(_, v)| v.is_some())
             .map(|(a, v)| SetRequest {
                 value: v.unwrap(),
-                address: a,
+                target: SetRequestTarget::Address(a),
             })
             .collect()
     }
@@ -180,23 +180,11 @@ impl TickValue {
 
 impl Runtime {
     pub(crate) async fn new(
-        client: alloy::tcp::AsyncClient,
-        mut push_receiver: tokio::sync::mpsc::Receiver<PushedMessage>,
+        config: UniverseConfig,
+        submarine_http_base_url: Url,
+        amqp_client: ExchangeSubmarineInput,
     ) -> Result<Runtime> {
-        // The server should send their config and initial values, so we first wait for those.
-        let config = {
-            let msg = push_receiver
-                .recv()
-                .await
-                .ok_or(anyhow!("did not receive universe config from server"))?;
-            match msg {
-                PushedMessage::Event(_) => {
-                    bail!("did not receive universe config as first message from server")
-                }
-                PushedMessage::Config(cfg) => cfg,
-            }
-        };
-
+        // Collect addresses of all input devices.
         let addresses: Vec<_> = config
             .devices
             .iter()
@@ -207,7 +195,39 @@ impl Runtime {
                     .chain(dev.outputs.iter().map(|d| d.address))
             })
             .collect();
-        let universe_view = Arc::new(Mutex::new(UniverseView::new_with_addresses(&addresses)));
+        let mut universe_view = UniverseView::new_with_addresses(&addresses);
+
+        // Get initial values from submarine
+        debug!("getting initial values from submarine...");
+        let initial_values = get_initial_values(&submarine_http_base_url)
+            .await
+            .context("unable to get initial values from submarine")?;
+        debug!("got initial values {:?}", initial_values);
+
+        let alias_to_address = config
+            .devices
+            .iter()
+            .flat_map(|dev| {
+                dev.inputs
+                    .iter()
+                    .map(|d| (d.alias.clone(), d.address))
+                    .chain(dev.outputs.iter().map(|d| (d.alias.clone(), d.address)))
+            })
+            .collect::<HashMap<_, _>>();
+        let initial_values_by_address = initial_values
+            .into_iter()
+            .map(|(addr, val)| {
+                (
+                    alias_to_address.get(&addr).expect("missing alias").clone(),
+                    val,
+                )
+            })
+            .collect();
+        universe_view
+            .apply_initial_values(initial_values_by_address)
+            .context("unable to apply initial values to universe view")?;
+
+        let universe_view = Arc::new(Mutex::new(universe_view));
         let events_counter = Arc::new(Mutex::new(0 as u64));
         let task_events_counter = events_counter.clone();
 
@@ -220,31 +240,32 @@ impl Runtime {
         // TODO check if two programs with the same priority output to the same addresses?
 
         // Aggregate and dedup event subscriptions from all programs, add an Update filter for every address
-        let event_subscriptions = Self::aggregate_event_filters(&programs, &addresses);
         let event_buffer = Arc::new(Mutex::new(VecDeque::new()));
 
         // Handle incoming events, keep our values up to date, buffer events etc.
         let task_universe_view = universe_view.clone();
         task::spawn(Self::handle_incoming_events_loop(
-            push_receiver,
+            amqp_client,
             task_universe_view,
             task_events_counter,
             event_buffer.clone(),
         ));
 
-        // Subscribe to any events needed by the programs, with an added type=update entry if missing, for every address.
-        // We want the change events to keep our view of values up to date.
-        Self::subscribe_with_change(&client, &event_subscriptions).await?;
-
-        let (set_tx, mut set_rx) = mpsc::channel(1);
+        let (set_tx, mut set_rx) = mpsc::channel::<Vec<SetRequest>>(1);
 
         task::spawn(async move {
             debug!("starting runtime set sender loop");
+
+            let client = reqwest::ClientBuilder::default()
+                .build()
+                .expect("unable to build HTTP client");
+
             while let Some(reqs) = set_rx.recv().await {
                 debug!("set sender: got requests {:?}", reqs);
 
                 let before = Instant::now();
-                let res = client.set(reqs).await;
+                let res =
+                    post_set_requests(&submarine_http_base_url, &client, reqs.as_slice()).await;
                 debug!("set took {}µs", before.elapsed().as_micros());
 
                 if let Err(e) = res {
@@ -493,59 +514,46 @@ impl Runtime {
         *self.events_processed.lock().await
     }
 
-    async fn subscribe_with_change(
-        client: &alloy::tcp::AsyncClient,
-        event_subscriptions: &HashMap<Address, EventFilter>,
-    ) -> Result<()> {
-        for (k, v) in event_subscriptions {
-            client
-                .subscribe(SubscriptionRequest {
-                    address: *k,
-                    strategy: v.strategy.clone(),
-                    filters: v.entries.clone(),
-                })
-                .await?;
-        }
-
-        Ok(())
-    }
-
     // This has to:
     // - Receive from client
     // - Apply change events to our view of the address space
     // - Filter for events for programs
     // - Forward to broadcast channel
     async fn handle_incoming_events_loop(
-        mut incoming: mpsc::Receiver<PushedMessage>,
+        mut incoming: ExchangeSubmarineInput,
         universe_view: Arc<Mutex<UniverseView>>,
         events_counter: Arc<Mutex<u64>>,
         event_buffer: Arc<Mutex<VecDeque<AddressedEvent>>>,
     ) {
         debug!("starting incoming events loop");
-        while let Some(push_msg) = incoming.recv().await {
-            debug!("got push message {:?}", push_msg);
-            if let PushedMessage::Event(event) = push_msg {
-                debug!("got event {:?}", event);
-                // Update event counter
-                {
-                    let mut events_counter = events_counter.lock().await;
-                    *events_counter += 1;
+        while let Some(delivery) = incoming.next().await {
+            debug!("got delivery {:?}", delivery);
+            match delivery {
+                Err(err) => {
+                    error!("unable to receive from AMQP: {:?}", err);
+                    return;
                 }
+                Ok((rk, event)) => {
+                    debug!("got event for routing key {:?}: {:?}", rk, event);
 
-                // First, update our view based on change events
-                {
-                    let mut values = universe_view.lock().await;
+                    // Update event counter
+                    {
+                        let mut events_counter = events_counter.lock().await;
+                        *events_counter += 1;
+                    }
 
-                    values
-                        .apply_event(&event)
-                        .expect("unable to apply event to universe view");
+                    // First, update our view based on change events
+                    {
+                        let mut values = universe_view.lock().await;
+
+                        values
+                            .apply_event(&event)
+                            .expect("unable to apply event to universe view");
+                    }
+
+                    // TODO we could filter these by events that any program is subscribed to
+                    event_buffer.lock().await.push_back(event)
                 }
-
-                // TODO we could filter these by events that any program is subscribed to
-                event_buffer.lock().await.push_back(event)
-            } else {
-                error!("received updated config from server");
-                return;
             }
         }
         debug!("quitting incoming events loop");
@@ -577,48 +585,38 @@ impl Runtime {
             .rev()
             .collect())
     }
+}
 
-    fn aggregate_event_filters(
-        programs: &Vec<Program>,
-        addresses: &Vec<Address>,
-    ) -> HashMap<Address, EventFilter> {
-        let mut all = programs.iter().map(|p| p.event_filters.clone()).fold(
-            HashMap::<Address, Vec<EventFilterEntry>, _>::new(),
-            |mut acc, filters| {
-                filters
-                    .into_iter()
-                    .for_each(|(k, v)| acc.entry(k).or_default().extend(v.entries.into_iter()));
-                acc
-            },
-        );
+async fn post_set_requests(
+    submarine_base_url: &Url,
+    client: &reqwest::Client,
+    set_requests: &[SetRequest],
+) -> Result<()> {
+    let mut u = submarine_base_url.clone();
+    u.set_path("api/v1/universe/set");
 
-        // Add a Update entry for every address
-        addresses.iter().for_each(|addr| {
-            all.entry(*addr).or_default().push(EventFilterEntry::Kind {
-                kind: EventFilterKind::Update,
-            })
-        });
+    client
+        .post(u)
+        .json(set_requests)
+        .send()
+        .await
+        .context("unable to post set requests to submarine")?;
 
-        // Sort, dedup
-        all.iter_mut().for_each(|(_, v)| {
-            v.sort_unstable();
-            v.dedup();
-        });
+    Ok(())
+}
 
-        // Make them into ANY event filters
-        let filters = all
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k,
-                    EventFilter {
-                        strategy: EventFilterStrategy::Any,
-                        entries: v,
-                    },
-                )
-            })
-            .collect();
+async fn get_initial_values(
+    submarine_base_url: &Url,
+) -> Result<HashMap<String, Option<TimestampedInputValue>>> {
+    let mut u = submarine_base_url.clone();
+    u.set_path("api/v1/universe/last_values");
 
-        return filters;
-    }
+    let resp: HashMap<String, Option<TimestampedInputValue>> = reqwest::get(u)
+        .await
+        .context("unable to get latest values from submarine")?
+        .json()
+        .await
+        .context("unable to decode latest values")?;
+
+    Ok(resp)
 }

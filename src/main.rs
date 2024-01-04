@@ -1,17 +1,18 @@
-use std::thread;
+use alloy::amqp::{ExchangeSubmarineInput, RoutingKeySubscription};
+use alloy::config::UniverseConfig;
 use std::time::{Duration, Instant};
 
-use alloy::tcp::AsyncClient;
+use crate::config::Config;
 use anyhow::Context;
 use flexi_logger::{DeferredNow, Logger, LoggerHandle, TS_DASHES_BLANK_COLONS_DOT_BLANK};
 use log::{debug, info, Record};
+use reqwest::Url;
 
 use crate::runtime::runtime::Runtime;
 
+mod config;
 mod prom;
 mod runtime;
-
-const REMOTE: &str = "127.0.0.1:3030";
 
 pub(crate) type Result<T> = anyhow::Result<T>;
 
@@ -47,18 +48,34 @@ pub fn set_up_logging() -> std::result::Result<LoggerHandle, Box<dyn std::error:
 async fn main() -> Result<()> {
     set_up_logging().unwrap();
 
-    info!("connecting...");
-    let (client, push_receiver) = alloy::tcp::AsyncClient::new(REMOTE).await?;
+    info!("reading config file...");
+    let cfg = Config::read_from_file("config.yaml").context("unable to read config file")?;
+    debug!("read config {:?}", cfg);
+
+    info!("connecting to Submarine...");
+    let submarine_base_url =
+        Url::parse(&cfg.submarine_http_url).context("unable to parse submarine base URL")?;
+    let universe_config = get_universe_config(&submarine_base_url)
+        .await
+        .context("unable to get universe config from submarine")?;
+    debug!("got universe config {:?}", universe_config);
+
+    info!("connecting to AMQP broker...");
+    let amqp_client =
+        ExchangeSubmarineInput::new(&cfg.amqp_server_address, &[RoutingKeySubscription::All])
+            .await
+            .context("unable to connect to AMQP broker")?;
+    debug!("connected with client {:?}", amqp_client);
 
     info!("setting up prometheus...");
-    prom::start_prometheus("127.0.0.1:4343".parse().unwrap())
-        .context("unable to start prometheus")?;
-
-    info!("testing connection...");
-    ping(&client).await?;
+    let prom_listen_address = cfg
+        .prometheus_listen_address
+        .parse()
+        .context("unable to parse prometheus listen address")?;
+    prom::start_prometheus(prom_listen_address).context("unable to start prometheus")?;
 
     info!("setting up runtime...");
-    let mut runtime = Runtime::new(client, push_receiver).await?;
+    let mut runtime = Runtime::new(universe_config, submarine_base_url, amqp_client).await?;
 
     info!("starting tick loop");
     let mut print_ticker = tokio::time::interval(Duration::from_secs(2));
@@ -106,31 +123,19 @@ async fn main() -> Result<()> {
 
                 i += 1;
             },
-            //default => {},
-        };
+        }
     }
-
-    Ok(())
 }
 
-async fn ping(client: &AsyncClient) -> Result<()> {
-    let mut pings = Vec::new();
-    for _i in 1..100 {
-        let before = Instant::now();
-        client.ping().await?;
-        let elapsed = before.elapsed();
-        pings.push(elapsed.as_micros() as f64);
+async fn get_universe_config(submarine_base_url: &Url) -> Result<UniverseConfig> {
+    let mut u = submarine_base_url.clone();
+    u.set_path("api/v1/universe/config");
+    let resp = reqwest::get(u)
+        .await
+        .context("unable to get universe config from submarine")?
+        .json()
+        .await
+        .context("unable to decode universe config")?;
 
-        thread::sleep(Duration::from_millis(20))
-    }
-    let min = pings.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-    let max = pings.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-    let mean = statistical::mean(&pings);
-    let stddev = statistical::standard_deviation(&pings, Some(mean));
-    info!(
-        "ping: min/max/mean {:.2}/{:.2}/{:.2} µs, stddev {:.2}",
-        min, max, mean, stddev
-    );
-
-    Ok(())
+    Ok(resp)
 }

@@ -1,12 +1,12 @@
+use crate::runtime::event::{
+    ButtonEventFilter, EventFilter, EventFilterEntry, EventFilterKind, EventFilterStrategy,
+};
 use crate::runtime::globals::DeltaTable;
 use crate::runtime::parameters::{DiscreteParameterValue, ParameterDelta, ParameterTable};
 use crate::runtime::UniverseView;
 use crate::Result;
 use alloy::config::{InputValue, UniverseConfig};
-use alloy::event::{
-    AddressedEvent, ButtonEvent, ButtonEventFilter, EventFilter, EventFilterEntry, EventFilterKind,
-    EventFilterStrategy, EventKind,
-};
+use alloy::event::{AddressedEvent, ButtonEvent, EventKind};
 use alloy::{Address, OutputValue};
 use anyhow::{anyhow, ensure};
 use chrono::Timelike;
