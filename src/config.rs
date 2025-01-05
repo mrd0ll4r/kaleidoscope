@@ -8,8 +8,10 @@ use std::path::Path;
 #[derive(Deserialize, Clone, Debug)]
 pub(crate) struct Config {
     pub(crate) prometheus_listen_address: String,
+    pub(crate) http_listen_address: String,
     pub(crate) amqp_server_address: String,
     pub(crate) submarine_http_url: String,
+    pub(crate) fixtures_path: String,
 }
 
 impl Config {

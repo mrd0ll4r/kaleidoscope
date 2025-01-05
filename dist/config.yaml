@@ -1,3 +1,10 @@
-amqp_server_address: "amqp://127.0.0.1:5672/%2f"
-submarine_http_url: "http://127.0.0.1:3069"
+# Address of the AMQP server used to publish status updates.
+amqp_server_address: "amqp://192.168.88.30:5672/%2f"
+# Address of the Submarine instance to post outputs to.
+submarine_http_url: "http://192.168.88.30:3069"
+# The address to expose Prometheus metrics on.
 prometheus_listen_address: "0.0.0.0:4343"
+# The address to expose the HTTP API on.
+http_listen_address: "0.0.0.0:3545"
+# The path from which to load fixtures and programs.
+fixtures_path: "./fixtures"

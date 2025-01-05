@@ -4,177 +4,142 @@ An environment to run Lua programs on top of Submarine.
 
 ## Description
 
-This is a program that connects to Submarine via TCP and executes Lua programs to control Virtual Devices attached to
+This is a program that connects to Submarine and executes Lua programs to control Output Devices attached to
 the Submarine instance.
 
 ## Configuration
 
+Configuration is done via YAML files.
+The main configuration file specifies basic properties and a path to a directory containing configuration files for
+the individual fixtures:
+```yaml
+# Address of the AMQP server used to publish status updates.
+amqp_server_address: "amqp://192.168.88.30:5672/%2f"
+# Address of the Submarine instance to post outputs to.
+submarine_http_url: "http://192.168.88.30:3069"
+# The address to expose Prometheus metrics on.
+prometheus_listen_address: "0.0.0.0:4343"
+# The address to expose the HTTP API on.
+http_listen_address: "0.0.0.0:3545"
+# The path from which to load fixtures and programs.
+fixtures_path: "./fixtures"
+```
+
+## HTTP API
+
+Kaleidoscope is controlled via a JSON-over-HTTP API.
+Currently, these routes are exposed:
+```
+GET  /api/v1/fixtures                                                        List fixtures.
+GET  /api/v1/fixtures/:fixture                                               Get single fixture.
+GET  /api/v1/fixtures/:fixture/programs                                      List programs for fixture.
+POST /api/v1/fixtures/:fixture/set_active_program                            Set active program by name, provide the name as text in the body.
+POST /api/v1/fixtures/:fixture/cycle_active_program                          Cycle to the next program, skipping MANUAL and EXTERNAL.
+GET  /api/v1/fixtures/:fixture/programs/:program                             Get single program.
+GET  /api/v1/fixtures/:fixture/programs/:program/parameters                  List parameters for program.
+GET  /api/v1/fixtures/:fixture/programs/:program/parameters/:parameter       Get single parameter.
+POST /api/v1/fixtures/:fixture/programs/:program/parameters/:parameter       Set parameter value, provide an alloy::program::ParameterSetRequest as JSON in the body.
+POST /api/v1/fixtures/:fixture/programs/:program/parameters/:parameter/cycle Cycle discrete parameter value.
+```
+
 ## The Lua Runtime
 
-We use [rlua](https://crates.io/crates/rlua), which means that our programs are to be Lua 5.3.
+We use [mlua](https://crates.io/crates/mlua), which means that our programs are Lua 5.4.
 
-On a high level, the `Runtime` manages a list of `Program`s in Lua, which are evaluated repeatedly at a regular
-interval.
-We call this interval a Tick.
+On a high level, the `Runtime` manages a list of `Fixtures`.
+Each `Fixture` has a list of `Program`s, of which one is currently active and being executed.
+Each `Program` can have a set of discrete and/or continuous `Parameters`.
 
-The Runtime evaluates all programs in parallel and aggregates their outputs, with higher-priority programs shadowing
-outputs of lower-priority programs for the same addresses.
-Priorities are unsigned integers in `[0,20]`.
-
-At the beginning of each Tick, before the programs begin execution, the Runtime sends events that occurred since the last Tick to the
-program.
+The Runtime evaluates all Fixtures in parallel.
+Each round of executions is called a tick, of which we target `200/s`.
 
 At the end of each tick, all outputs are aggregated into one request and sent to Submarine.
 Submarine then processes that request mostly-atomically.
 
-### General Structure of Programs
+### Fixtures
 
-Every program has a number of inputs and outputs as well as event filters associated with it.
-These are registered when the program is loaded and cannot be modified later.
+A Fixture is a set of output addresses controlled by one active Program.
+It defines a list of outputs and Programs, and configures other Fixture-wide parameters.
+A Fixture definition is itself a valid Lua program.
+One Fixture is defined per input file, with the `setup` function setting up the Fixture.
 
-The reason for this is as follows:
+Here's an annotated example:
+```lua
+SOURCE_VERSION=3
 
-- We need to know event filters to set up event routing/buffering and whatnot, which all runs in parallel to program
-    execution.
-    Modifying these later could potentially introduce stop-the-world pauses which are probably not good for realtime
-    applications.
-- We need to know outputs in order to build a priority queue for program execution.
-    Asssume we have a program _A_ with priority 5 and a program _B_ with priority 10.
-    Program _A_ registered addresses 22 and 23 as outputs, and program _B_ registered 21, 22, 23, and 24.
-    We can now execute program _B_ to compute the values to set for addresses 21 to 24.
-    After that we can skip execution of program _A_ because we know that its outputs would be shadowed by program _B_
-    anyways.
-    _However_, we can only do this optimization because we declared a program's output addresses as invariant.
-- We need to know inputs to save some memory and copying.
-    This is by far not as strict and necessary, but might enable some other optimizations later.
+function setup()
+    -- Set a name for the Fixture.
+    fixture_name("klo_rgbw")
 
-Every program consists of three basic building blocks:
+    -- Add outputs.
+    add_output_alias('klo-r')
+    add_output_alias('klo-g')
+    add_output_alias('klo-b')
+    add_output_alias('klo-w')
 
-#### The `setup` Function
+    -- Whether to disable the builtin MANUAL program.
+    --disable_manual_program(true)
+    
+    -- Whether to disable the builtin ON and OFF programs.
+    --disable_builtin_programs(true)
+    
+    -- (Optional) programs to load.
+    add_program("noise", "foo/noise.lua")
+end
+```
 
-When the Runtime loads a program, it calls its `setup()` function to set up inputs and outputs, register for events, and
-determine the priority of a program.
-This function should not be used to write outputs.
+The functions available for Fixture setup are listed in [src/runtime/lua/fixture_builtin.lua](src/runtime/lua/fixture_builtin.lua).
 
-In the context of `setup()`, a bunch of special functions can be called, which are not available later:
+### Builtin Programs
 
-- `set_priority(u8 <= 20)` sets the program's priority.
-- `set_slow_mode(bool)` marks whether this program should run in slow mode.
-    The default is false (i.e., fast mode).
-    See below for more information about slow mode and program execution.
-- `add_input_alias(string)` adds an alias to the inputs.
-    This resolves the alias to its address and adds the numerical address to the program's outputs.
-    It is checked whether the alias exists.
-- `add_input_address(address)` adds a numerical address to the inputs.
-    It is checked whether the address exists as a virtual device.
-    _I recommend not using this_, because addresses might change and are tedious to maintain.
-    Use the alias variant instead.
-- `add_output_alias(string)` adds an alias to the outputs.
-    This resolves the alias to its numerical address and behaves like `add_input_alias` in general.
-- `add_output_address(address)` analogous to `add_input_address`, again not recommended.
-- `add_output_group(string)` adds a group of addresses to the outputs.
-    This resolves the group to its members' addresses and adds those to the outputs.
-- `add_event_subscription(alias: string, type_name: string, target: string)` adds an event subscription with a type
-    filter and a callable target.
-    The first parameter is the alias of an input device from which to receive events.
-    The second parameter is a filter for the type of the events to receive.
-    Currently, possible values are `change`, `button_down`, `button_up`, `button_clicked`, and `button_long_press`.
-    The last parameter is the name of a function (as a string!) to be called to handle the events.
-    The handler function must handle three parameters:
-    - The address (`u16`) of the event.
-    - The type (`string`) of the event.
-    - A value (`number`) contained in the event, which only applies to events of type `change` (which contains the new
-        value), `button_clicked` (which contains the duration for which the button was pressed, as `f64` seconds),
-        and `button_long_press` (which contains the number of seconds for which the button was pressed, as `u64`).
-        All other events do not contain a value and `-1` will be passed to the handler.
+By default, each Fixture has three programs generated for it:
+- `OFF`, which sets all outputs of the fixture to `LOW`.
+- `ON`, which sets all outputs of the fixture to `ON`.
+- `MANUAL`, which generates a continuous parameter for each output of the fixture and sets them according to the
+  parameter values.
 
-TODO callable programs, rename inputs/outputs.
+### Programs
 
-#### Event Handlers
+Every Program must contain a `setup` function and a `tick` function.
+The `setup` function is called once, during Program initialization.
+The `tick` function is called in regular intervals if the program is currently active.
 
-A program may have event handlers, which behave as described above.
-Programs do not have to work with events -- in particular, they should __not__ use events to update an internal "view"
-of the address space.
-The Runtime maintains this view automatically and makes it available to programs through the `get_(address|alias)`
-functions, which are also much faster than event handlers.
+During `setup`, a Program defines Parameters, which are mutable through the HTTP API.
+Parameter values can then be accessed during the `tick` function.
 
-It is not possible to set output values from within event handlers (or rather,
-changes are only applied when `tick` runs next).
-All program variables, however, can be modified.
-For programs in slow mode, handling an event marks them to be executed in the
-current tick and resets the slow mode timer.
-
-Handling events is __slow__ in comparison to reading inputs and modifying outputs through `tick`.
-This is rooted in the complexity associated with moving events from Rust-space to Lua-space and calling in between the
-two, some performance numbers (and implementation frustrations) can be found throughout the source code.
-
-To give two concrete examples:
-
-- You have a program that changes the color of your living room to red when the temperature outside is above 40 °C.
-    You read the temperature outside with a DHT22 sensor, so you can get a new value _at most_ every two seconds, not
-    faster.
-    The rate of `change` events in this case is low.
-    You should use events and slow mode.
-- You have a program that mirrors all lighting from your living room's RGBW LED strips to your toilet's.
-    You could either copy-paste your code for the living room and somehow ensure the same programs are always running
-    for your toilet, or you could write a program that sets the toilet lights to whatever is currently set for the
-    living room (with one Tick delay).
-    You should _not_ use events for this, because the rate of events is probably high.
-    Instead, just `get` the values on each tick and `set` them for the toilet.
+In the context of `setup()`, a bunch of special functions can be called, which are not available later.
+See [src/runtime/lua/program_builtin.lua](src/runtime/lua/program_builtin.lua) for a list.
 
 #### The `tick` Function
 
 At the heart of every program is the `tick(now: f64)` function.
-It takes one parameter, the current time in `f64` seconds since an unspecified epoch.
+It takes one parameter, the current time in `f64` seconds since an unspecified epoch available as `START`.
 
-The Runtime usually calls this function on each Tick, but might decide not to. (See optimization notes above).
-Because of this, the `tick` function __must not have side effects that rely on it being called on every Tick__.
-As an example: Do not increment a counter on each Tick and calculate outputs based on it -- use the provided timestamp
+For enabled Programs, the Runtime usually calls this function on each tick.
+Programs can elect to be handled in "slow mode", which can be useful for outputs that do not require short reaction
+times or frequent updates.
+
+Because of this, the `tick` function __must not rely on it being called in a regular interval__.
+As an example: Do not increment a counter on each tick and calculate outputs based on it -- use the provided timestamp
 to calculate outputs.
 
 The `tick` function can call other functions and do whatever Lua can do, but it should run as fast as possible.
-The Runtime keeps track of both the global Tick duration and `tick` durations for each program, which might be useful
+The Runtime keeps track of both the global tick duration and `tick` durations for each program, which might be useful
 for debugging.
 
 #### Slow mode
 
 Usually programs are run at every tick.
-Slow mode programs are run every 1000 ticks or on event arrival.
+Slow mode programs are run every 1000 ticks.
 The reason for this is that some programs can probably deal with the added
 latency, which frees some performance for the programs that need to execute
 every tick.
-Events are still injected as soon as they arrive.
-If an event matches for a program in slow mode, the slow mode counter is reset
-and the program is run in the current tick.
 
-#### Overwriting Values, Order of Execution
-
-For every output address a priority-sorted list of programs writing to this
-output is maintained.
-On each tick, the runtime tries to find a minimal subset of programs to execute
-this tick in order to fill every output address with the value of the
-highest-priority program for this output, using a greedy algorithm:
-If, for any output, there is an unexecuted program that writes to this output
-with a higher priority than the assigned value (or no value is assigned yet),
-the program is run and its outputs are assigned.
-
-This could cause problems with slow mode programs, which "disappear" from the
-list of runnable functions for the 999 ticks in which they are not run.
-During this time, lower-priority programs could change the value, which would
-lead to visual glitches.
-The alternative to this would be basing occupation of an output address not on
-whether a program has written a value to it, but rather whether any enabled
-program has marked the address as its output.
-This causes other problems, for example with high-priority programs writing
-to many addresses, like stroboscopes or other global effects.
-These high-priority programs would then "hog" the output at all times.
-We'll have to see if this is actually an issue in practice.
-
-
-### Builtins
+#### Builtins
 
 The Runtime provides a bunch of builtin functions and constants, of which some are written in Rust and some in Lua.
-These are:
+See [src/runtime/lua/program_builtin.lua](src/runtime/lua/program_builtin.lua) for a complete list.
+Notable mentions:
 
 - `KALEIDOSCOPE_VERSION: int`, which denotes the version of the Runtime.
 - `START: f64` and `NOW: f64` denote the program epoch and current timestamp, both as `f64` seconds.
@@ -184,51 +149,81 @@ These are:
     This is implemented in Rust and slower than the 2D version.
 - `noise4d(f64, f64, f64, f64) -> f64` computes 4D Perlin noise in `[-1,1]`.
     This is implemented in Rust and slower than the 3D version.
-
-The following are implemented in Lua and can be found in [src/builtin.lua](src/runtime/builtin.lua):
-
 - `now() -> f64` gets the time in seconds since the program epoch.
+- `get_parameter_value(name)` gets the current value of the named parameter.
 - `clamp(from: numer, to: number, x: number) -> number` clamps `x` to `[from, to]`. 
 - `lerp(from: number, to: number, x: number) -> number` interpolates between `from` and `to`.
 - `map_range(a_lower: number, a_upper: number, b_lower: number, b_upper: number, x: number) -> number` maps `x` from the
     first range to the second.
 - `map_to_value(from: number, to: number, x: number) -> u16` maps `x` from `[from,to]` to the 16-bit Submarine value
     range.
-- `alias_to_address(alias: string) -> u16` translates an alias to a numerical address, if it exists.
+- `output_alias_to_address(alias: string) -> u16` translates an alias to a numerical address, if it exists.
     Raises an error otherwise.
-- `group_to_addresses(group: string) -> [u16]` translates a group name to a list of addresses.
-    Raises an error if the group does not exist.
 - `set_alias(alias: string, value: u16)` sets the output at `alias` to `value`.
     Make sure to call this with integers, probably breaks with non-integers...
-- `set_group(group: string, value: u16)` sets the group `group` to `value`.
-    Make sure to call this with integers, probably breaks with non-integers...
-- `get_alias(alias) -> u16` gets the value of the device at `alias`.
-    Note that this is the most-up-to-date value from before the Tick was started.
-    Specifically, values `set_` by other programs are not visible during the current tick.
-- `EVENT_TYPE_UPDATE`, `EVENT_TYPE_BUTTON_DOWN`, `EVENT_TYPE_BUTTON_UP`, `EVENT_TYPE_BUTTON_CLICKED`, 
-    `EVENT_TYPE_ERROR`, and `EVENT_TYPE_BUTTON_LONG_PRESS` are string constants for the event types.
 
 ## Example Programs
 
-The [programs/](programs) directory contains a few example programs.
-Specifically, you can look at them to see the following:
+Here's an example program that sets four channels of an `RGBW` output to a Perlin-noise color:
 
-- [programs/sine.lua](programs/sine.lua) computes four time-shifted narrow sines for one RGBW strip.
-    It does not use any events and shows how to organize code in a useful manner.
-- [programs/noise.lua](programs/noise.lua) generates Perlin noise for one RGBW strip.
-    Note that we use 2D Perlin noise with a fixed value for `x` and a time-dependent `y`.
-    In practice, we sample parallel lines from the 2D space.
-- [programs/motion-button.lua](programs/motion-button.lua) reacts to events for buttons and motion sensors to smoothly
-    switch lighting.
-    There is a couple of things to note here:
-    - We show two different ways to interact with events, either by routing them to different handler functions or
-        by routing them through one handler function and switching by address.
-    - We show Lua tables.
-    - We show that reading values and resolving aliases to addresses is possible in `setup()`.
+```lua
+SOURCE_VERSION=3
+
+-- Constants
+local r = 0
+local g = 1
+local b = 2
+local w = 3
+local sine_speed = 0.07
+local noise_speed = 0.1
+
+-- Parameters
+local MODE_BRIGHTNESS_NAME = "brightness"
+local MODE_BRIGHTNESS_NIGHT = "night"
+local MODE_BRIGHTNESS_DAY = "day"
+
+-- Variables
+local current_brightness_mode = MODE_BRIGHTNESS_NIGHT
+
+function setup()
+    local p_brightness = new_discrete_parameter(MODE_BRIGHTNESS_NAME)
+    add_discrete_parameter_level(p_brightness, MODE_BRIGHTNESS_NIGHT, "dunkel")
+    add_discrete_parameter_level(p_brightness, MODE_BRIGHTNESS_DAY, "hell")
+    declare_discrete_parameter(p_brightness)
+end
+
+function compute_white(index, now)
+    local t = now * sine_speed
+
+    if current_brightness_mode == MODE_BRIGHTNESS_DAY then
+        return map_to_value(0, 1, map_range(-1, 1, 0.9, 1, math.sin(t + (math.pi / 4) * index)))
+    end
+    return map_to_value(0, 1, map_range(-1, 1, 0.7, 0.8, math.sin(t + (math.pi / 4) * index)))
+end
+
+function compute_color(index, now)
+    local t = now * noise_speed
+
+    if current_brightness_mode == MODE_BRIGHTNESS_DAY then
+        return map_to_value(0, 1, map_range(-1, 1, 0.8, 1, noise2d(index, t)))
+    end
+    return map_to_value(0, 1, map_range(-1, 1, 0.5, 0.9, noise2d(index, t)))
+end
+
+function tick(now)
+    current_brightness_mode = get_parameter_value(MODE_BRIGHTNESS_NAME)
+
+    set_alias('klo-w', compute_white(w, now))
+    set_alias('klo-r', compute_color(r, now))
+    set_alias('klo-g', compute_color(g, now))
+    set_alias('klo-b', compute_color(b, now))
+end
+```
 
 ## Compilation & Running
 
 See the [README of Submarine](../submarine/README.md), which explains setup and cross-compilation for Linux on a Raspberry Pi.
 
-In general, while it is not required to run Kaleidoscope on the same machine as Submarine, we have observed that this benefits lighting performance because of lower latency variance.
+In general, while it is not required to run Kaleidoscope on the same machine as Submarine,
+we have observed that this benefits lighting performance because of lower latency variance.
 

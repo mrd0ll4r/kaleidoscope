@@ -1,622 +1,136 @@
-use crate::runtime::globals::DeltaTable;
-use crate::runtime::parameters::ParameterTable;
-use crate::runtime::program::{Program, ProgramEnableDelta};
-use crate::runtime::UniverseView;
-use crate::Result;
-use alloy::amqp::ExchangeSubmarineInput;
-use alloy::api::{SetRequest, SetRequestTarget, TimestampedInputValue};
+use crate::runtime::fixture::Fixture;
+use alloy::api::SetRequest;
 use alloy::config::UniverseConfig;
-use alloy::event::AddressedEvent;
-use alloy::{Address, OutputValue};
-use anyhow::Context;
-use futures::StreamExt;
-use itertools::Itertools;
-use log::{debug, error, info, warn};
-use reqwest::Url;
-use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Local};
+use log::{debug, warn};
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, Mutex};
-use tokio::task;
+use std::time::Instant;
+
+pub(crate) struct TickState {
+    pub(crate) timestamp: Instant,
+    pub(crate) local_time: DateTime<Local>,
+}
+
+struct WrappedFixture {
+    inner: Fixture,
+    set_requests: Vec<SetRequest>,
+}
+
+impl WrappedFixture {
+    fn wrap(fixture: Fixture) -> WrappedFixture {
+        let num_outputs = fixture.addresses.len();
+        WrappedFixture {
+            inner: fixture,
+            set_requests: Vec::with_capacity(num_outputs),
+        }
+    }
+
+    fn tick(&mut self, state: &TickState) -> Result<&[SetRequest]> {
+        self.set_requests.clear();
+        self.inner
+            .run_current_program(state, &mut self.set_requests)?;
+
+        debug!(
+            "{}::run_current_program produced set requests {:?}",
+            self.inner.name, self.set_requests
+        );
+
+        Ok(&self.set_requests)
+    }
+}
 
 pub(crate) struct Runtime {
-    _universe_view: Arc<Mutex<UniverseView>>,
-    set_tx: mpsc::Sender<Vec<SetRequest>>,
-    events_processed: Arc<Mutex<u64>>,
-
-    // This uses a std::sync::Mutex because we hand copies of this to Lua, which can't do
-    // Rust async things.
-    program_parameters: Arc<std::sync::Mutex<ParameterTable>>,
-
-    // ordered by priority descending
-    loaded_programs: Vec<Rc<WrappedProgram>>,
-    tick_values: Vec<TickValue>,
-
-    // stores events received asynchronously, to be handled with the next tick
-    event_buffer: Arc<Mutex<VecDeque<AddressedEvent>>>,
+    fixtures: Vec<WrappedFixture>,
+    set_requests: Vec<SetRequest>,
 }
 
 impl Runtime {
-    fn pre_tick(&mut self) {
-        self.loaded_programs.iter().for_each(|p| p.reset_run());
-        self.tick_values.iter_mut().for_each(|v| v.reset())
-    }
-
-    fn post_tick_collect_values(&self) -> Vec<SetRequest> {
-        self.tick_values
-            .iter()
-            .map(|tv| (tv.address, tv.get_highest_priority_value()))
-            .filter(|(_, v)| v.is_some())
-            .map(|(a, v)| SetRequest {
-                value: v.unwrap(),
-                target: SetRequestTarget::Address(a),
-            })
-            .collect()
-    }
-
-    fn apply_tick_generated_outputs(
-        &mut self,
-        values: HashMap<Address, OutputValue>,
-        priority: u8,
-    ) {
-        values.into_iter().for_each(|(a, v)| {
-            let value_index = self
-                .tick_values
-                .binary_search_by_key(&a, |v| v.address)
-                .expect(format!("missing tick_value for address {}", a).as_str());
-            self.tick_values[value_index].set_value_for_priority(priority, v);
-        })
-    }
-}
-
-#[derive(Debug)]
-struct WrappedProgram {
-    program: Program,
-    // This tracks how many ticks in the future we should run this program next.
-    // A value of zero indicates that it should be run this tick (or next tick, depending on
-    // where within the tick we are).
-    execute_in_ticks: Cell<u16>,
-    executed_this_tick: Cell<bool>,
-    enabled: Cell<bool>,
-}
-
-impl WrappedProgram {
-    fn mark_run(&self) {
-        self.executed_this_tick.set(true);
-    }
-
-    // This should be called once, pre-tick, for _every_ program.
-    // This will reset the executed bit and decrement the run-next-tick counter.
-    fn reset_run(&self) {
-        if self.executed_this_tick.get() {
-            if self.program.slow_mode {
-                self.execute_in_ticks.set(999);
-            } else {
-                self.execute_in_ticks.set(0);
-            }
-        } else {
-            // Programs are not guaranteed to be executed every tick, even if they're ready.
-            // Something with low priority could be left out.
-            // To avoid underflows, better check that counter first...
-            if self.execute_in_ticks.get() > 0 {
-                self.execute_in_ticks.set(self.execute_in_ticks.get() - 1);
-            }
-        }
-
-        self.executed_this_tick.set(false);
-    }
-
-    fn force_run_this_tick(&self) {
-        self.execute_in_ticks.set(0)
-    }
-
-    // Returns whether this program should be run during the current tick.
-    // A program should run if it's enabled, hasn't executed this tick yet, and is on the right
-    // tick count (for slow-mode programs).
-    fn should_run_this_tick(&self) -> bool {
-        self.enabled.get() && !self.executed_this_tick.get() && self.execute_in_ticks.get() == 0
-    }
-}
-
-#[derive(Debug)]
-struct TickValue {
-    address: Address,
-    produced_values: [Option<OutputValue>; 20],
-    // sorted by priority descending
-    programs_for_this_value: Vec<Rc<WrappedProgram>>,
-    highest_priority_set_value: Option<u8>,
-}
-
-impl TickValue {
-    fn has_higher_priority_program_available(&self) -> bool {
-        let prog = self.get_highest_priority_non_executed_program();
-        match prog {
-            None => false,
-            Some(prog) => match self.highest_priority_set_value {
-                None => true,
-                Some(prio) => prio < prog.program.priority,
-            },
-        }
-    }
-
-    fn get_highest_priority_non_executed_program(&self) -> Option<Rc<WrappedProgram>> {
-        self.programs_for_this_value
-            .iter()
-            .find(|p| p.should_run_this_tick())
-            .map(|p| p.clone())
-    }
-
-    fn get_highest_priority_value(&self) -> Option<OutputValue> {
-        self.highest_priority_set_value
-            .map(|prio| self.produced_values[(prio - 1) as usize])
-            .flatten()
-    }
-
-    fn set_value_for_priority(&mut self, priority: u8, value: OutputValue) {
-        assert!(priority <= 20);
-        assert!(priority > 0);
-        debug!(
-            "setting value {} with priority {} for address {}, current values: {:?}",
-            value, priority, self.address, self.produced_values
-        );
-        let index = (priority - 1) as usize;
-        self.produced_values[index] = self.produced_values[index].or_else(|| Some(value));
-        self.highest_priority_set_value = self
-            .highest_priority_set_value
-            .or_else(|| Some(0))
-            .map(|prio| prio.max(priority))
-    }
-
-    fn reset(&mut self) {
-        self.produced_values.iter_mut().for_each(|v| *v = None);
-        self.highest_priority_set_value = None
-    }
-}
-
-impl Runtime {
-    pub(crate) async fn new(
-        config: UniverseConfig,
-        submarine_http_base_url: Url,
-        amqp_client: ExchangeSubmarineInput,
+    pub(crate) fn new<P: AsRef<Path>>(
+        fixtures_root: P,
+        universe_config: &UniverseConfig,
     ) -> Result<Runtime> {
-        // Collect addresses of all input devices.
-        let addresses: Vec<_> = config
-            .devices
-            .iter()
-            .flat_map(|dev| {
-                dev.inputs
-                    .iter()
-                    .map(|d| d.address)
-                    .chain(dev.outputs.iter().map(|d| d.address))
-            })
-            .collect();
-        let mut universe_view = UniverseView::new_with_addresses(&addresses);
-
-        // Get initial values from submarine
-        debug!("getting initial values from submarine...");
-        let initial_values = get_initial_values(&submarine_http_base_url)
-            .await
-            .context("unable to get initial values from submarine")?;
-        debug!("got initial values {:?}", initial_values);
-
-        let alias_to_address = config
-            .devices
-            .iter()
-            .flat_map(|dev| {
-                dev.inputs
-                    .iter()
-                    .map(|d| (d.alias.clone(), d.address))
-                    .chain(dev.outputs.iter().map(|d| (d.alias.clone(), d.address)))
-            })
-            .collect::<HashMap<_, _>>();
-        let initial_values_by_address = initial_values
-            .into_iter()
-            .map(|(addr, val)| {
-                (
-                    alias_to_address.get(&addr).expect("missing alias").clone(),
-                    val,
-                )
-            })
-            .collect();
-        universe_view
-            .apply_initial_values(initial_values_by_address)
-            .context("unable to apply initial values to universe view")?;
-
-        let universe_view = Arc::new(Mutex::new(universe_view));
-        let events_counter = Arc::new(Mutex::new(0 as u64));
-        let task_events_counter = events_counter.clone();
-
-        let program_parameters = Arc::new(std::sync::Mutex::new(ParameterTable::new()));
-
-        // Load and setup programs
-        let programs =
-            Self::load_programs("programs/", &config, program_parameters.clone()).await?;
-
-        // TODO check if two programs with the same priority output to the same addresses?
-
-        // Aggregate and dedup event subscriptions from all programs, add an Update filter for every address
-        let event_buffer = Arc::new(Mutex::new(VecDeque::new()));
-
-        // Handle incoming events, keep our values up to date, buffer events etc.
-        let task_universe_view = universe_view.clone();
-        task::spawn(Self::handle_incoming_events_loop(
-            amqp_client,
-            task_universe_view,
-            task_events_counter,
-            event_buffer.clone(),
-        ));
-
-        let (set_tx, mut set_rx) = mpsc::channel::<Vec<SetRequest>>(1);
-
-        task::spawn(async move {
-            debug!("starting runtime set sender loop");
-
-            let client = reqwest::ClientBuilder::default()
-                .build()
-                .expect("unable to build HTTP client");
-
-            while let Some(reqs) = set_rx.recv().await {
-                debug!("set sender: got requests {:?}", reqs);
-
-                let before = Instant::now();
-                let res =
-                    post_set_requests(&submarine_http_base_url, &client, reqs.as_slice()).await;
-                debug!("set took {}µs", before.elapsed().as_micros());
-
-                if let Err(e) = res {
-                    error!("unable to set: {:?}", e);
-                    return;
-                }
+        let mut fixtures: Vec<Fixture> = Vec::new();
+        for entry in fs::read_dir(&fixtures_root).context("unable to list fixtures")? {
+            let entry = entry.context("unable to enumerate fixtures sources")?;
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip
+                continue;
             }
-            debug!("quitting runtime set sender loop");
-        });
 
-        let programs: Vec<_> = programs
-            .into_iter()
-            .map(|p| {
-                Rc::new(WrappedProgram {
-                    program: p,
-                    execute_in_ticks: Cell::new(0),
-                    executed_this_tick: Cell::new(false),
-                    enabled: Cell::new(true),
-                })
-            })
-            .collect();
+            // Attempt to load as a fixture
+            let fix = Fixture::new(&path, universe_config)
+                .context(format!("unable to load fixture at {:?}", &path))?;
 
-        let tick_values = addresses
-            .into_iter()
-            .map(|addr| TickValue {
-                address: addr,
-                produced_values: Default::default(),
-                programs_for_this_value: programs
-                    .iter()
-                    .filter(|p| p.program.outputs.contains(&addr))
-                    .cloned()
-                    .sorted_by_key(|p| p.program.priority)
-                    .rev()
-                    .collect(),
-                highest_priority_set_value: None,
-            })
-            .sorted_by_key(|tv| tv.address)
-            .collect();
+            if let Some(f) = fixtures.iter().find(|f| f.name == fix.name) {
+                bail!(
+                    "duplicate fixture: {} in file {:?} (other was {:?})",
+                    fix.name,
+                    &path,
+                    &f.source_path
+                )
+            }
+
+            fixtures.push(fix)
+        }
 
         Ok(Runtime {
-            loaded_programs: programs,
-            _universe_view: universe_view,
-            set_tx,
-            events_processed: events_counter,
-            tick_values,
-            event_buffer,
-            program_parameters,
+            fixtures: fixtures.into_iter().map(WrappedFixture::wrap).collect(),
+            set_requests: Vec::with_capacity(16),
         })
     }
 
-    pub async fn populate_prom(&self) {
-        crate::prom::ACTIVE_PROGRAMS.set(
-            self.loaded_programs
-                .iter()
-                .filter(|p| p.enabled.get())
-                .count() as f64,
-        );
-        crate::prom::LOADED_PROGRAMS.set(self.loaded_programs.len() as f64);
-    }
+    pub(crate) fn tick(&mut self) -> Result<&[SetRequest]> {
+        self.set_requests.clear();
 
-    pub async fn tick(&mut self) -> Result<Duration> {
-        debug!("starting tick");
-        // Clear flags and computed values.
-        self.pre_tick();
-
-        // Collect updates to globals from all programs.
-        let mut deltas = HashMap::new();
-        for p in self.loaded_programs.iter() {
-            match p.program.get_global_deltas() {
-                Ok(d) => deltas.extend(d.into_iter()),
-                Err(err) => {
-                    warn!(
-                        "program {}: unable to get global deltas: {:?}",
-                        p.program.name, err
-                    )
-                }
-            }
-        }
-
-        // Update globals if there was any delta.
-        if !deltas.is_empty() {
-            let dt = DeltaTable::from_map(deltas);
-            for p in self.loaded_programs.iter() {
-                match p.program.update_globals(&dt) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        warn!(
-                            "program {}: unable to update globals: {:?}",
-                            p.program.name, err
-                        )
-                    }
-                }
-            }
-        }
-
-        // Collect events.
-        let events = {
-            let mut buf = self.event_buffer.lock().await;
-            let buf_cloned = buf.clone();
-            buf.clear();
-            Arc::new(buf_cloned)
-        };
         let now = Instant::now();
-
-        // Handle events for all programs, regardless of whether their tick is enabled or whatnot.
-        // Matching events "wakes up" programs in slow mode.
-        for p in self.loaded_programs.iter() {
-            match p.program.handle_incoming_events(events.clone()).await {
-                Ok(any_matched) => {
-                    if any_matched {
-                        p.force_run_this_tick()
-                    }
-                }
-                Err(err) => {
-                    warn!(
-                        "program {}: unable to apply events: {:?}",
-                        p.program.name, err
-                    )
-                }
-            }
-        }
-
-        // Collect program enable/disable deltas.
-        // These are collected (and cleared) after events are processed, for all programs,
-        // regardless of whether they are enabled or tick ran. This way, we can have event-handler
-        // programs without a tick function, and programs that actually drive the outputs.
-        let mut deltas = HashMap::new();
-        for p in self.loaded_programs.iter() {
-            match p.program.get_program_enable_deltas() {
-                Ok(d) => deltas.extend(d.into_iter()),
-                Err(err) => {
-                    warn!(
-                        "program {}: unable to get program enable deltas: {:?}",
-                        p.program.name, err
-                    )
-                }
-            }
-        }
-
-        // Enable/disable programs according to the deltas.
-        for (program_name, state_change) in deltas.into_iter() {
-            match self
-                .loaded_programs
-                .iter_mut()
-                .find(|p| p.program.name == program_name)
-            {
-                None => {
-                    warn!(
-                        "got program enable/disable delta for unknown program {}: {:?}",
-                        program_name, state_change
-                    )
-                }
-                Some(p) => match state_change {
-                    ProgramEnableDelta::Enable => p.enabled.set(true),
-                    ProgramEnableDelta::Disable => p.enabled.set(false),
-                    ProgramEnableDelta::Toggle => p.enabled.set(!p.enabled.get()),
-                },
-            }
-        }
-
-        // Handle parameter deltas
-        let mut deltas = {
-            let params = self.program_parameters.clone();
-            tokio::task::spawn_blocking(move || params.lock().unwrap().get_deltas())
-                .await
-                .context("unable to lock parameter table")?
+        let dt = Local::now();
+        let ts = TickState {
+            timestamp: now.clone(),
+            local_time: dt,
         };
-        for p in self.loaded_programs.iter() {
-            if let Some(deltas) = deltas.remove(&p.program.name) {
-                if let Err(e) = p.program.handle_incoming_parameter_deltas(deltas) {
-                    warn!(
-                        "program {}: unable to handle parameter updates: {:?}",
-                        p.program.name, e
-                    )
-                }
-            }
-        }
 
-        // Iterate over all addresses
-        // Find first without any value set
-        // Execute highest-priority program for that address that has not been executed yet
-        // Apply that program's outputs to all addresses
-        // Repeat until all addresses are set or all programs have been executed
-        loop {
-            let next_program_to_execute = self
-                .tick_values
-                .iter()
-                .find(|tv| tv.has_higher_priority_program_available())
-                .map(|tv| tv.get_highest_priority_non_executed_program())
-                .flatten();
-            debug!("next program to execute: {:?}", next_program_to_execute);
-
-            match next_program_to_execute {
-                None => {
-                    debug!("no more addresses to fill, finishing tick");
-                    break;
-                }
-                Some(program) => {
-                    program.program.inject_inputs().await?;
-                    program.mark_run();
-                    let outputs = program.program.tick(now);
-                    match outputs {
-                        Ok(outputs) => {
-                            debug!(
-                                "program {} produced outputs {:?}",
-                                program.program.name, outputs
-                            );
-                            self.apply_tick_generated_outputs(outputs, program.program.priority);
-                        }
-                        Err(err) => {
-                            warn!(
-                                "program {}: unable to execute: {:?}",
-                                program.program.name, err
-                            )
-                            // TODO stop executing this for... a while?
-                        }
-                    }
-                }
-            }
-
-            // Any programs left to run?
-            // This is potentially faster than iterating through the list of outputs.
-            if self
-                .loaded_programs
-                .iter()
-                .find(|p| p.should_run_this_tick())
-                .is_none()
-            {
-                debug!("all programs executed, finishing tick");
-                break;
-            }
-        }
-        let dur = now.elapsed();
-
-        // Collect set requests from generated values
-        let set_requests = self.post_tick_collect_values();
-        debug!("produced set requests: {:?}", set_requests);
-        if !set_requests.is_empty() {
-            self.set_tx.send(set_requests).await.unwrap()
-        }
-
-        Ok(dur)
-    }
-
-    pub async fn events_processed(&self) -> u64 {
-        *self.events_processed.lock().await
-    }
-
-    // This has to:
-    // - Receive from client
-    // - Apply change events to our view of the address space
-    // - Filter for events for programs
-    // - Forward to broadcast channel
-    async fn handle_incoming_events_loop(
-        mut incoming: ExchangeSubmarineInput,
-        universe_view: Arc<Mutex<UniverseView>>,
-        events_counter: Arc<Mutex<u64>>,
-        event_buffer: Arc<Mutex<VecDeque<AddressedEvent>>>,
-    ) {
-        debug!("starting incoming events loop");
-        while let Some(delivery) = incoming.next().await {
-            debug!("got delivery {:?}", delivery);
-            match delivery {
+        for fixture in self.fixtures.iter_mut() {
+            match fixture.tick(&ts) {
                 Err(err) => {
-                    error!("unable to receive from AMQP: {:?}", err);
-                    return;
+                    warn!("unable to tick fixture {}: {:?}", fixture.inner.name, err)
                 }
-                Ok((rk, event)) => {
-                    debug!("got event for routing key {:?}: {:?}", rk, event);
-
-                    // Update event counter
-                    {
-                        let mut events_counter = events_counter.lock().await;
-                        *events_counter += 1;
-                    }
-
-                    // First, update our view based on change events
-                    {
-                        let mut values = universe_view.lock().await;
-
-                        values
-                            .apply_event(&event)
-                            .expect("unable to apply event to universe view");
-                    }
-
-                    // TODO we could filter these by events that any program is subscribed to
-                    event_buffer.lock().await.push_back(event)
-                }
+                Ok(res) => self.set_requests.extend(res.iter().cloned()),
             }
         }
-        debug!("quitting incoming events loop");
+        debug!("tick took {}µs", now.elapsed().as_micros());
+        debug!("tick produced set requests {:?}", self.set_requests);
+
+        Ok(&self.set_requests)
     }
 
-    async fn load_programs<P: AsRef<Path>>(
-        dir: P,
-        universe_config: &UniverseConfig,
-        parameters: Arc<std::sync::Mutex<ParameterTable>>,
-    ) -> Result<Vec<Program>> {
-        let mut programs = Vec::new();
-        let files = fs::read_dir(dir)?;
-        let files = files
-            .filter_map(std::result::Result::ok)
-            .filter(|d| d.path().extension() == Some(OsStr::new("lua")))
-            .collect_vec();
-
-        for file in files {
-            info!("attempting to load program at {:?}...", file.path());
-            let p = Program::new(universe_config, parameters.clone(), file.path())
-                .await
-                .context(format!("unable to load program at {:?}", file.path()))?;
-            programs.push(p);
+    pub(crate) fn alloy_metadata(
+        &self,
+        universe: &UniverseConfig,
+    ) -> alloy::program::KaleidoscopeMetadata {
+        alloy::program::KaleidoscopeMetadata {
+            fixtures: self
+                .fixtures
+                .iter()
+                .map(|f| &f.inner)
+                .map(|f| (f.name.clone(), f.alloy_metadata(universe)))
+                .collect(),
         }
-
-        Ok(programs
-            .into_iter()
-            .sorted_by_key(|p| p.priority)
-            .rev()
-            .collect())
     }
-}
 
-async fn post_set_requests(
-    submarine_base_url: &Url,
-    client: &reqwest::Client,
-    set_requests: &[SetRequest],
-) -> Result<()> {
-    let mut u = submarine_base_url.clone();
-    u.set_path("api/v1/universe/set");
+    pub(crate) fn get_fixture(&self, name: &str) -> Option<&Fixture> {
+        self.fixtures
+            .iter()
+            .find(|f| f.inner.name == name)
+            .map(|f| &f.inner)
+    }
 
-    client
-        .post(u)
-        .json(set_requests)
-        .send()
-        .await
-        .context("unable to post set requests to submarine")?;
-
-    Ok(())
-}
-
-async fn get_initial_values(
-    submarine_base_url: &Url,
-) -> Result<HashMap<String, Option<TimestampedInputValue>>> {
-    let mut u = submarine_base_url.clone();
-    u.set_path("api/v1/universe/last_values");
-
-    let resp: HashMap<String, Option<TimestampedInputValue>> = reqwest::get(u)
-        .await
-        .context("unable to get latest values from submarine")?
-        .json()
-        .await
-        .context("unable to decode latest values")?;
-
-    Ok(resp)
+    pub(crate) fn get_fixture_mut(&mut self, name: &str) -> Option<&mut Fixture> {
+        self.fixtures
+            .iter_mut()
+            .find(|f| f.inner.name == name)
+            .map(|f| &mut f.inner)
+    }
 }
